@@ -12,31 +12,47 @@ import time
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- Interfaz de chat ---
+# --- Interfaz principal ---
 st.set_page_config(page_title="ChatMuleGPT", layout="centered")
+
+# --- Estilo visual ---
 st.markdown("""
 <style>
-/* Ocultar texto del file uploader y dejar solo el ícono 📎 */
-div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] {
-    border: none;
-    padding: 0;
-    margin: 0;
+/* Reemplazar el cuadro de subida por un icono de clip */
+div[data-testid="stFileUploader"] {
+    border: none !important;
+    background: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
 }
-div[data-testid="stFileUploader"] > label {
-    display: none;
+div[data-testid="stFileUploaderDropzone"] {
+    border: none !important;
+    background: transparent !important;
+    text-align: center !important;
+    height: 40px !important;
+    width: 40px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    cursor: pointer !important;
 }
 div[data-testid="stFileUploaderDropzone"] div {
     visibility: hidden;
 }
 div[data-testid="stFileUploaderDropzone"]::before {
     content: "📎";
-    visibility: visible;
     font-size: 24px;
+    visibility: visible;
     cursor: pointer;
+    transition: transform 0.15s ease-in-out;
+}
+div[data-testid="stFileUploaderDropzone"]:hover::before {
+    transform: scale(1.2);
 }
 </style>
 """, unsafe_allow_html=True)
 
+# --- Encabezado ---
 st.title("🤖 ChatMuleGPT – Generador de Proyectos Mulesoft")
 st.caption("Sube tu archivo `.raml` o `.docx` con el 📎 y conversa con el asistente mientras genera tu proyecto.")
 
@@ -51,8 +67,8 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# --- Clip estilizado (uploader oculto) ---
-col1, col2 = st.columns([0.08, 0.92])
+# --- Campo del chat con clip integrado ---
+col1, col2 = st.columns([0.1, 0.9])
 with col1:
     uploaded = st.file_uploader("", type=["raml", "docx"], label_visibility="collapsed", key="uploader")
     if uploaded:
@@ -66,7 +82,7 @@ with col1:
 with col2:
     user_input = st.chat_input("Escribe tu mensaje o pide generar el proyecto...")
 
-# --- Procesar mensaje del usuario ---
+# --- Procesar interacción ---
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
@@ -75,7 +91,6 @@ if user_input:
     with st.chat_message("assistant"):
         placeholder = st.empty()
 
-        # Validar archivo cargado
         if not st.session_state.uploaded_file:
             placeholder.markdown("📎 Por favor, adjunta primero un archivo `.raml` o `.docx` usando el clip.")
         else:
@@ -91,11 +106,10 @@ if user_input:
                     st.error(f"❌ No se encontró el archivo del arquetipo en: {arquetipo_zip_path}")
                     st.stop()
 
-                # Descomprimir arquetipo
                 with zipfile.ZipFile(arquetipo_zip_path, "r") as zip_ref:
                     zip_ref.extractall(arquetipo_path)
 
-                # Leer contenido del archivo
+                # Leer contenido
                 if file_extension == "raml":
                     content = uploaded_file.read().decode("utf-8", errors="ignore")
                 elif file_extension == "docx":
@@ -171,16 +185,14 @@ if user_input:
                 progreso_texto.text("✅ Todos los archivos procesados.")
                 progreso.progress(1.0)
 
-                # Crear log
                 log_path = os.path.join(arquetipo_path, "log_modificaciones.txt")
                 with open(log_path, "w", encoding="utf-8") as log:
-                    log.write("🧠 Archivos modificados en el arquetipo Mulesoft:\n\n")
+                    log.write("🧠 Archivos modificados:\n\n")
                     for f in modified_files:
                         log.write(f"- {f}\n")
                     log.write("\n---\n")
                     log.write(result_log)
 
-                # Comprimir
                 zip_out = os.path.join(temp_dir, "proyecto_generado.zip")
                 shutil.make_archive(zip_out.replace(".zip", ""), 'zip', arquetipo_path)
 
