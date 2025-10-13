@@ -14,6 +14,29 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # --- Interfaz de chat ---
 st.set_page_config(page_title="ChatMuleGPT", layout="centered")
+st.markdown("""
+<style>
+/* Ocultar texto del file uploader y dejar solo el ícono 📎 */
+div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] {
+    border: none;
+    padding: 0;
+    margin: 0;
+}
+div[data-testid="stFileUploader"] > label {
+    display: none;
+}
+div[data-testid="stFileUploaderDropzone"] div {
+    visibility: hidden;
+}
+div[data-testid="stFileUploaderDropzone"]::before {
+    content: "📎";
+    visibility: visible;
+    font-size: 24px;
+    cursor: pointer;
+}
+</style>
+""", unsafe_allow_html=True)
+
 st.title("🤖 ChatMuleGPT – Generador de Proyectos Mulesoft")
 st.caption("Sube tu archivo `.raml` o `.docx` con el 📎 y conversa con el asistente mientras genera tu proyecto.")
 
@@ -28,10 +51,10 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# --- Botón de clip (uploader) ---
-col1, col2 = st.columns([0.1, 0.9])
+# --- Clip estilizado (uploader oculto) ---
+col1, col2 = st.columns([0.08, 0.92])
 with col1:
-    uploaded = st.file_uploader("📎", type=["raml", "docx"], label_visibility="collapsed", key="uploader")
+    uploaded = st.file_uploader("", type=["raml", "docx"], label_visibility="collapsed", key="uploader")
     if uploaded:
         st.session_state.uploaded_file = uploaded
         st.session_state.messages.append({
