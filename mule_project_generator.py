@@ -12,43 +12,52 @@ import time
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- Interfaz tipo chat ---
+# --- Interfaz de chat ---
 st.set_page_config(page_title="ChatMuleGPT", layout="centered")
 st.title("🤖 ChatMuleGPT – Generador de Proyectos Mulesoft")
-st.caption("Sube tu archivo `.raml` o `.docx` (DTM) y conversa con el bot mientras genera tu proyecto automáticamente.")
+st.caption("Sube tu archivo `.raml` o `.docx` con el 📎 y conversa con el asistente mientras genera tu proyecto.")
 
-# Inicializar historial del chat
+# --- Estado del chat ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "uploaded_file" not in st.session_state:
+    st.session_state.uploaded_file = None
 
-# Mostrar historial de mensajes
+# --- Mostrar historial del chat ---
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# --- Subida de archivos ---
-uploaded_file = st.file_uploader("📂 Adjunta tu archivo (.raml o .docx):", type=["raml", "docx"])
+# --- Botón de clip (uploader) ---
+col1, col2 = st.columns([0.1, 0.9])
+with col1:
+    uploaded = st.file_uploader("📎", type=["raml", "docx"], label_visibility="collapsed", key="uploader")
+    if uploaded:
+        st.session_state.uploaded_file = uploaded
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": f"📁 Archivo `{uploaded.name}` recibido y listo para procesar."
+        })
+        st.rerun()
 
-# --- Entrada del usuario ---
-if user_input := st.chat_input("Escribe tu mensaje o pide generar el proyecto..."):
-    # Mostrar mensaje del usuario en el chat
+with col2:
+    user_input = st.chat_input("Escribe tu mensaje o pide generar el proyecto...")
+
+# --- Procesar mensaje del usuario ---
+if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Procesar respuesta del asistente
     with st.chat_message("assistant"):
-        message_placeholder = st.empty()
+        placeholder = st.empty()
 
-        # Si no hay archivo, responder de manera informativa
-        if not uploaded_file:
-            response_text = "📎 Por favor, adjunta un archivo `.raml` o `.docx` para generar el proyecto."
-            message_placeholder.markdown(response_text)
-            st.session_state.messages.append({"role": "assistant", "content": response_text})
+        # Validar archivo cargado
+        if not st.session_state.uploaded_file:
+            placeholder.markdown("📎 Por favor, adjunta primero un archivo `.raml` o `.docx` usando el clip.")
         else:
-            # Detectar tipo de archivo
+            uploaded_file = st.session_state.uploaded_file
             file_extension = uploaded_file.name.split(".")[-1].lower()
-            message_placeholder.markdown(f"🔍 Procesando tu archivo `{uploaded_file.name}`...")
 
             with tempfile.TemporaryDirectory() as temp_dir:
                 arquetipo_path = os.path.join(temp_dir, "arquetipo")
@@ -59,35 +68,35 @@ if user_input := st.chat_input("Escribe tu mensaje o pide generar el proyecto...
                     st.error(f"❌ No se encontró el archivo del arquetipo en: {arquetipo_zip_path}")
                     st.stop()
 
-                # Descomprimir arquetipo base
+                # Descomprimir arquetipo
                 with zipfile.ZipFile(arquetipo_zip_path, "r") as zip_ref:
                     zip_ref.extractall(arquetipo_path)
 
-                # Leer contenido del archivo cargado
+                # Leer contenido del archivo
                 if file_extension == "raml":
                     content = uploaded_file.read().decode("utf-8", errors="ignore")
                 elif file_extension == "docx":
                     doc = Document(uploaded_file)
                     content = "\n".join([p.text for p in doc.paragraphs])
                 else:
-                    message_placeholder.markdown("⚠️ Tipo de archivo no soportado.")
+                    placeholder.markdown("⚠️ Tipo de archivo no soportado.")
                     st.stop()
 
-                message_placeholder.markdown("✏️ Reescribiendo archivos del arquetipo con la información detectada...")
+                placeholder.markdown(f"🧩 Procesando `{uploaded_file.name}` y reescribiendo archivos del arquetipo...")
 
                 result_log = ""
                 modified_files = []
                 extensiones_permitidas = (".xml", ".raml", ".yaml", ".yml", ".properties", ".md", ".txt")
 
                 archivos_relevantes = [
-                    os.path.join(root, file_name)
+                    os.path.join(root, f)
                     for root, _, files in os.walk(arquetipo_path)
-                    for file_name in files
-                    if file_name.endswith(extensiones_permitidas)
+                    for f in files if f.endswith(extensiones_permitidas)
                 ]
 
-                total_archivos = len(archivos_relevantes)
+                total = len(archivos_relevantes)
                 progreso = st.progress(0)
+                progreso_texto = st.empty()
 
                 for i, file_path in enumerate(archivos_relevantes, start=1):
                     file_name = os.path.basename(file_path)
@@ -95,29 +104,28 @@ if user_input := st.chat_input("Escribe tu mensaje o pide generar el proyecto...
                         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                             original = f.read()
 
-                        file_prompt = f"""
+                        prompt = f"""
                         Tienes el siguiente archivo de un proyecto Mulesoft llamado `{file_name}`.
-                        Reescríbelo de acuerdo al diseño técnico o RAML proporcionado.
-                        Mantén el formato original y estructura.
-                        Si no se requiere cambio, devuelve el mismo contenido sin alterar.
+                        Reescríbelo según el archivo RAML/DTM adjunto. Mantén formato y estructura.
+                        Si no hay cambios, devuelve el mismo contenido sin modificar.
 
                         Contenido original:
                         ---
                         {original[:2000]}
                         ---
 
-                        Contexto del microservicio:
+                        Contexto técnico:
                         ---
                         {content[:4000]}
                         ---
-                        Devuelve únicamente el nuevo contenido del archivo, sin explicaciones adicionales.
+                        Devuelve solo el nuevo contenido, sin explicaciones.
                         """
 
-                        response = client.chat.completions.create(  # type: ignore
+                        response = client.chat.completions.create(
                             model="gpt-3.5-turbo",
                             messages=[
                                 {"role": "system", "content": "Asistente experto en proyectos Mulesoft."},
-                                {"role": "user", "content": file_prompt}
+                                {"role": "user", "content": prompt}
                             ],
                             temperature=0.3
                         )
@@ -133,35 +141,34 @@ if user_input := st.chat_input("Escribe tu mensaje o pide generar el proyecto...
                     except Exception as e:
                         result_log += f"⚠️ Error modificando {file_name}: {e}\n"
 
-                    progreso.progress(i / total_archivos)
+                    progreso.progress(i / total)
+                    progreso_texto.text(f"Procesando archivo {i}/{total}: {file_name}")
                     time.sleep(0.1)
 
+                progreso_texto.text("✅ Todos los archivos procesados.")
                 progreso.progress(1.0)
-                message_placeholder.markdown("✅ Archivos procesados correctamente. Generando proyecto...")
 
                 # Crear log
                 log_path = os.path.join(arquetipo_path, "log_modificaciones.txt")
-                with open(log_path, "w", encoding="utf-8") as log_file:
-                    log_file.write("🧠 Registro de archivos modificados en el arquetipo Mulesoft\n")
-                    log_file.write("==========================================================\n\n")
-                    for file_name in modified_files:
-                        log_file.write(f"- {file_name}\n")
-                    log_file.write("\n\nResumen del proceso:\n")
-                    log_file.write(result_log)
+                with open(log_path, "w", encoding="utf-8") as log:
+                    log.write("🧠 Archivos modificados en el arquetipo Mulesoft:\n\n")
+                    for f in modified_files:
+                        log.write(f"- {f}\n")
+                    log.write("\n---\n")
+                    log.write(result_log)
 
-                # Comprimir en ZIP
-                output_zip_path = os.path.join(temp_dir, "proyecto_generado.zip")
-                shutil.make_archive(output_zip_path.replace(".zip", ""), 'zip', arquetipo_path)
+                # Comprimir
+                zip_out = os.path.join(temp_dir, "proyecto_generado.zip")
+                shutil.make_archive(zip_out.replace(".zip", ""), 'zip', arquetipo_path)
 
-                # Descargar resultado
-                with open(output_zip_path, "rb") as f:
+                with open(zip_out, "rb") as f:
                     st.download_button(
-                        label="⬇️ Descargar Proyecto Generado (.zip)",
-                        data=f,
+                        "⬇️ Descargar Proyecto Generado (.zip)",
+                        f,
                         file_name="proyecto_generado.zip",
                         mime="application/zip"
                     )
 
-                response_text = "🎉 Proyecto Mulesoft generado con éxito. Puedes descargar el ZIP con los archivos actualizados."
-                message_placeholder.markdown(response_text)
+                response_text = "🎉 Proyecto generado exitosamente. Puedes descargar el ZIP con los archivos actualizados."
+                placeholder.markdown(response_text)
                 st.session_state.messages.append({"role": "assistant", "content": response_text})
