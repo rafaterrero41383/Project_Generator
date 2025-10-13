@@ -1,59 +1,109 @@
-import streamlit as st
-import zipfile
 import os
 import shutil
 import tempfile
+import time
+import zipfile
+
+import streamlit as st
+from PIL import Image
 from docx import Document
 from dotenv import load_dotenv
 from openai import OpenAI
-import time
 
 # --- Configuración inicial ---
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- Interfaz principal ---
 st.set_page_config(page_title="ChatMuleGPT", layout="centered")
 
-# --- CSS personalizado: reemplaza el uploader por botón circular con clip ---
+# --- CSS visual ---
 st.markdown("""
 <style>
-/* Ocultar texto y bordes del uploader original */
-div[data-testid="stFileUploader"] {
-    border: none !important;
-    background: transparent !important;
+body {
+    background-color: #f5f6fa !important;
 }
-div[data-testid="stFileUploaderDropzone"] {
-    border: none !important;
-    background: transparent !important;
-    text-align: center !important;
-    height: 44px !important;
-    width: 44px !important;
-    border-radius: 50% !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    transition: background-color 0.3s ease, transform 0.15s ease-in-out;
-    cursor: pointer !important;
-    color: #666 !important;
+
+/* Ventana blanca del chat */
+.main-window {
+    background-color: #fff;
+    border-radius: 20px;
+    box-shadow: 0 8px 25px rgba(0,0,0,0.08);
+    padding: 40px 50px;
+    margin-top: 40px;
+    max-width: 900px;
+    margin-left: auto;
+    margin-right: auto;
 }
-div[data-testid="stFileUploaderDropzone"] div {
-    visibility: hidden;
+
+/* Contenedor del clip */
+.clip-wrapper {
+    position: relative;
+    width: 54px;
+    height: 54px;
+    margin-top: 10px;
 }
-div[data-testid="stFileUploaderDropzone"]::before {
-    content: "📎";
-    font-size: 22px;
-    visibility: visible;
-    color: inherit;
+
+/* Imagen del clip */
+.clip-img {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    object-fit: cover;
+    transition: transform 0.2s ease-in-out;
+    box-shadow: 0 3px 8px rgba(0,0,0,0.1);
 }
-div[data-testid="stFileUploaderDropzone"]:hover {
-    transform: scale(1.1);
-    background-color: rgba(0, 0, 0, 0.05);
-}
-div[data-testid="stFileUploaderDropzone"].uploaded {
-    background-color: #3adb76 !important; /* Verde suave */
-    color: white !important;
+
+/* Hover */
+.clip-img:hover {
     transform: scale(1.05);
+}
+
+/* Estado cargado */
+.clip-img.uploaded {
+    filter: hue-rotate(80deg) brightness(1.2);
+}
+
+/* Input invisible (área clicable real) */
+.upload-overlay input[type="file"] {
+    position: absolute;
+    opacity: 0;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    cursor: pointer;
+    z-index: 10;
+}
+
+/* Check animado */
+.checkmark {
+    position: absolute;
+    top: -5px;
+    right: -5px;
+    font-size: 18px;
+    color: #32CD32;
+    opacity: 0;
+    animation: popFade 1s ease-in-out forwards;
+    z-index: 15;
+}
+
+@keyframes popFade {
+    0% { opacity: 0; transform: scale(0.5) rotate(-20deg); }
+    25% { opacity: 1; transform: scale(1.2) rotate(10deg); }
+    60% { opacity: 1; transform: scale(1) rotate(0deg); }
+    100% { opacity: 0; transform: scale(0.8) rotate(-10deg); }
+}
+
+/* Ocultar uploader nativo */
+div[data-testid="stFileUploader"] {
+    height: 0 !important;
+    overflow: hidden !important;
+    visibility: hidden !important;
+}
+
+/* Espaciado del input */
+[data-testid="stChatInput"] {
+    margin-top: 20px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -62,46 +112,62 @@ div[data-testid="stFileUploaderDropzone"].uploaded {
 st.title("🤖 ChatMuleGPT – Generador de Proyectos Mulesoft")
 st.caption("Sube tu archivo `.raml` o `.docx` con el 📎 y conversa con el asistente mientras genera tu proyecto.")
 
-# --- Estado del chat ---
+# --- Contenedor principal ---
+st.markdown('<div class="main-window">', unsafe_allow_html=True)
+
+# --- Estado global ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "uploaded_file" not in st.session_state:
     st.session_state.uploaded_file = None
+if "show_check" not in st.session_state:
+    st.session_state.show_check = False
 
 # --- Mostrar historial del chat ---
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# --- Layout del chat: clip + input ---
-col1, col2 = st.columns([0.08, 0.92])
+# --- Layout del chat ---
+col1, col2 = st.columns([0.1, 0.9])
 
 with col1:
-    # Clip minimalista
+    st.markdown('<div class="clip-wrapper">', unsafe_allow_html=True)
+
+    # Clip visible (imagen)
+    clip_class = "clip uploaded" if st.session_state.uploaded_file else "clip"
+    # Buscar automáticamente el ícono (png o jpeg)
+    possible_icons = ["clip_icon.png", "clip.jpeg", "clip.jpg"]
+    icon_path = next((f for f in possible_icons if os.path.exists(f)), None)
+
+    if icon_path is None:
+        st.warning(
+            "⚠️ No se encontró la imagen del clip. Asegúrate de tener 'clip.jpeg' o 'clip_icon.png' en la raíz del proyecto.")
+    else:
+        img = Image.open(icon_path)
+        st.image(img, use_container_width=True)
+
+    # Overlay invisible clicable
     uploaded = st.file_uploader("", type=["raml", "docx"], label_visibility="collapsed", key="uploader")
-    clip_placeholder = st.empty()
+
     if uploaded:
-        # Guardar archivo y marcar éxito visual
         st.session_state.uploaded_file = uploaded
         st.session_state.messages.append({
             "role": "assistant",
             "content": f"📁 Archivo `{uploaded.name}` recibido y listo para procesar."
         })
-        # Inyectar script que colorea el clip al verde
-        st.markdown("""
-        <script>
-        const dropzones = parent.document.querySelectorAll('div[data-testid="stFileUploaderDropzone"]');
-        if (dropzones.length) {
-            dropzones[0].classList.add('uploaded');
-        }
-        </script>
-        """, unsafe_allow_html=True)
-        st.rerun()
+        st.session_state.show_check = True
+
+    if st.session_state.show_check:
+        st.markdown('<div class="checkmark">✅</div>', unsafe_allow_html=True)
+        st.session_state.show_check = False
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 with col2:
     user_input = st.chat_input("Escribe tu mensaje o pide generar el proyecto...")
 
-# --- Procesar mensaje del usuario ---
+# --- Procesamiento del mensaje ---
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
@@ -128,7 +194,7 @@ if user_input:
                 with zipfile.ZipFile(arquetipo_zip_path, "r") as zip_ref:
                     zip_ref.extractall(arquetipo_path)
 
-                # Leer contenido del archivo
+                # Leer archivo
                 if file_extension == "raml":
                     content = uploaded_file.read().decode("utf-8", errors="ignore")
                 elif file_extension == "docx":
@@ -204,14 +270,6 @@ if user_input:
                 progreso_texto.text("✅ Todos los archivos procesados.")
                 progreso.progress(1.0)
 
-                log_path = os.path.join(arquetipo_path, "log_modificaciones.txt")
-                with open(log_path, "w", encoding="utf-8") as log:
-                    log.write("🧠 Archivos modificados:\n\n")
-                    for f in modified_files:
-                        log.write(f"- {f}\n")
-                    log.write("\n---\n")
-                    log.write(result_log)
-
                 zip_out = os.path.join(temp_dir, "proyecto_generado.zip")
                 shutil.make_archive(zip_out.replace(".zip", ""), 'zip', arquetipo_path)
 
@@ -226,3 +284,5 @@ if user_input:
                 response_text = "🎉 Proyecto generado exitosamente. Puedes descargar el ZIP con los archivos actualizados."
                 placeholder.markdown(response_text)
                 st.session_state.messages.append({"role": "assistant", "content": response_text})
+
+st.markdown("</div>", unsafe_allow_html=True)
