@@ -12,150 +12,156 @@ import time
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- Interfaz ---
-st.set_page_config(page_title="Generador Optimizado de Proyecto Mulesoft", layout="centered")
-st.title("🧠 Generador Optimizado de Proyecto Mulesoft")
-st.markdown("""
-Sube un archivo `.raml` o `.docx` (DTM) y el sistema reescribirá automáticamente los archivos relevantes del arquetipo Mulesoft  
-usando el modelo rápido `gpt-3.5-turbo`, reescritura selectiva y un registro de cambios.
-""")
+# --- Interfaz tipo chat ---
+st.set_page_config(page_title="ChatMuleGPT", layout="centered")
+st.title("🤖 ChatMuleGPT – Generador de Proyectos Mulesoft")
+st.caption("Sube tu archivo `.raml` o `.docx` (DTM) y conversa con el bot mientras genera tu proyecto automáticamente.")
 
-# --- Cargar archivo de entrada ---
-uploaded_file = st.file_uploader("📂 Carga tu archivo (.raml o .docx):", type=["raml", "docx"])
+# Inicializar historial del chat
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-if uploaded_file:
-    file_extension = uploaded_file.name.split(".")[-1].lower()
-    st.write(f"**Archivo detectado:** `{uploaded_file.name}` ({file_extension.upper()})")
+# Mostrar historial de mensajes
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        arquetipo_path = os.path.join(temp_dir, "arquetipo")
-        os.makedirs(arquetipo_path, exist_ok=True)
+# --- Subida de archivos ---
+uploaded_file = st.file_uploader("📂 Adjunta tu archivo (.raml o .docx):", type=["raml", "docx"])
 
-        arquetipo_zip_path = os.path.join(os.getcwd(), "arquetipo-mulesoft.zip")
-        if not os.path.exists(arquetipo_zip_path):
-            st.error(f"❌ No se encontró el archivo del arquetipo en: {arquetipo_zip_path}")
-            st.stop()
+# --- Entrada del usuario ---
+if user_input := st.chat_input("Escribe tu mensaje o pide generar el proyecto..."):
+    # Mostrar mensaje del usuario en el chat
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
 
-        # Descomprimir arquetipo base
-        with zipfile.ZipFile(arquetipo_zip_path, "r") as zip_ref:
-            zip_ref.extractall(arquetipo_path)
-        st.success("✅ Arquetipo base cargado correctamente.")
+    # Procesar respuesta del asistente
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
 
-        # Leer contenido del archivo cargado
-        if file_extension == "raml":
-            content = uploaded_file.read().decode("utf-8", errors="ignore")
-        elif file_extension == "docx":
-            doc = Document(uploaded_file)
-            content = "\n".join([p.text for p in doc.paragraphs])
+        # Si no hay archivo, responder de manera informativa
+        if not uploaded_file:
+            response_text = "📎 Por favor, adjunta un archivo `.raml` o `.docx` para generar el proyecto."
+            message_placeholder.markdown(response_text)
+            st.session_state.messages.append({"role": "assistant", "content": response_text})
         else:
-            st.error("Tipo de archivo no soportado.")
-            st.stop()
+            # Detectar tipo de archivo
+            file_extension = uploaded_file.name.split(".")[-1].lower()
+            message_placeholder.markdown(f"🔍 Procesando tu archivo `{uploaded_file.name}`...")
 
-        st.subheader("📘 Vista previa del contenido cargado:")
-        st.text_area("Vista previa", content[:2000], height=200)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                arquetipo_path = os.path.join(temp_dir, "arquetipo")
+                os.makedirs(arquetipo_path, exist_ok=True)
 
-        if st.button("🚀 Generar Proyecto"):
-            st.info("✏️ Reescribiendo archivos relevantes del arquetipo con los datos detectados...")
+                arquetipo_zip_path = os.path.join(os.getcwd(), "arquetipo-mulesoft.zip")
+                if not os.path.exists(arquetipo_zip_path):
+                    st.error(f"❌ No se encontró el archivo del arquetipo en: {arquetipo_zip_path}")
+                    st.stop()
 
-            result_log = ""
-            modified_files = []
+                # Descomprimir arquetipo base
+                with zipfile.ZipFile(arquetipo_zip_path, "r") as zip_ref:
+                    zip_ref.extractall(arquetipo_path)
 
-            # Extensiones relevantes
-            extensiones_permitidas = (".xml", ".raml", ".yaml", ".yml", ".properties", ".md", ".txt")
+                # Leer contenido del archivo cargado
+                if file_extension == "raml":
+                    content = uploaded_file.read().decode("utf-8", errors="ignore")
+                elif file_extension == "docx":
+                    doc = Document(uploaded_file)
+                    content = "\n".join([p.text for p in doc.paragraphs])
+                else:
+                    message_placeholder.markdown("⚠️ Tipo de archivo no soportado.")
+                    st.stop()
 
-            # Obtener lista total de archivos relevantes
-            archivos_relevantes = [
-                os.path.join(root, file_name)
-                for root, _, files in os.walk(arquetipo_path)
-                for file_name in files
-                if file_name.endswith(extensiones_permitidas)
-            ]
+                message_placeholder.markdown("✏️ Reescribiendo archivos del arquetipo con la información detectada...")
 
-            total_archivos = len(archivos_relevantes)
-            progreso = st.progress(0)
-            progreso_texto = st.empty()
+                result_log = ""
+                modified_files = []
+                extensiones_permitidas = (".xml", ".raml", ".yaml", ".yml", ".properties", ".md", ".txt")
 
-            for i, file_path in enumerate(archivos_relevantes, start=1):
-                file_name = os.path.basename(file_path)
-                try:
-                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                        original = f.read()
+                archivos_relevantes = [
+                    os.path.join(root, file_name)
+                    for root, _, files in os.walk(arquetipo_path)
+                    for file_name in files
+                    if file_name.endswith(extensiones_permitidas)
+                ]
 
-                    # Prompt optimizado
-                    file_prompt = f"""
-                    Tienes el siguiente archivo de un proyecto Mulesoft llamado `{file_name}`.
-                    Reescríbelo de acuerdo al diseño técnico o RAML proporcionado.
-                    Mantén el formato original y la estructura del archivo.
-                    No inventes rutas ni endpoints que no existan.
-                    Si no se requiere cambio, devuelve el mismo contenido sin alterar.
+                total_archivos = len(archivos_relevantes)
+                progreso = st.progress(0)
 
-                    Contenido original:
-                    ---
-                    {original[:2000]}
-                    ---
+                for i, file_path in enumerate(archivos_relevantes, start=1):
+                    file_name = os.path.basename(file_path)
+                    try:
+                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                            original = f.read()
 
-                    Contexto del microservicio:
-                    ---
-                    {content[:4000]}
-                    ---
-                    Devuelve únicamente el nuevo contenido del archivo, sin explicaciones adicionales.
-                    """
+                        file_prompt = f"""
+                        Tienes el siguiente archivo de un proyecto Mulesoft llamado `{file_name}`.
+                        Reescríbelo de acuerdo al diseño técnico o RAML proporcionado.
+                        Mantén el formato original y estructura.
+                        Si no se requiere cambio, devuelve el mismo contenido sin alterar.
 
-                    # Llamada al modelo
-                    response = client.chat.completions.create(  # type: ignore
-                        model="gpt-3.5-turbo",
-                        messages=[
-                            {"role": "system", "content": "Asistente experto en proyectos Mulesoft."},
-                            {"role": "user", "content": file_prompt}
-                        ],
-                        temperature=0.3
+                        Contenido original:
+                        ---
+                        {original[:2000]}
+                        ---
+
+                        Contexto del microservicio:
+                        ---
+                        {content[:4000]}
+                        ---
+                        Devuelve únicamente el nuevo contenido del archivo, sin explicaciones adicionales.
+                        """
+
+                        response = client.chat.completions.create(  # type: ignore
+                            model="gpt-3.5-turbo",
+                            messages=[
+                                {"role": "system", "content": "Asistente experto en proyectos Mulesoft."},
+                                {"role": "user", "content": file_prompt}
+                            ],
+                            temperature=0.3
+                        )
+
+                        new_content = response.choices[0].message.content.strip()
+
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            f.write(new_content)
+
+                        modified_files.append(file_name)
+                        result_log += f"✅ {file_name} modificado correctamente.\n"
+
+                    except Exception as e:
+                        result_log += f"⚠️ Error modificando {file_name}: {e}\n"
+
+                    progreso.progress(i / total_archivos)
+                    time.sleep(0.1)
+
+                progreso.progress(1.0)
+                message_placeholder.markdown("✅ Archivos procesados correctamente. Generando proyecto...")
+
+                # Crear log
+                log_path = os.path.join(arquetipo_path, "log_modificaciones.txt")
+                with open(log_path, "w", encoding="utf-8") as log_file:
+                    log_file.write("🧠 Registro de archivos modificados en el arquetipo Mulesoft\n")
+                    log_file.write("==========================================================\n\n")
+                    for file_name in modified_files:
+                        log_file.write(f"- {file_name}\n")
+                    log_file.write("\n\nResumen del proceso:\n")
+                    log_file.write(result_log)
+
+                # Comprimir en ZIP
+                output_zip_path = os.path.join(temp_dir, "proyecto_generado.zip")
+                shutil.make_archive(output_zip_path.replace(".zip", ""), 'zip', arquetipo_path)
+
+                # Descargar resultado
+                with open(output_zip_path, "rb") as f:
+                    st.download_button(
+                        label="⬇️ Descargar Proyecto Generado (.zip)",
+                        data=f,
+                        file_name="proyecto_generado.zip",
+                        mime="application/zip"
                     )
 
-                    new_content = response.choices[0].message.content.strip()
-
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(new_content)
-
-                    modified_files.append(file_name)
-                    result_log += f"✅ {file_name} modificado correctamente.\n"
-
-                except Exception as e:
-                    result_log += f"⚠️ Error modificando {file_name}: {e}\n"
-
-                # Actualizar progreso visual
-                progreso.progress(i / total_archivos)
-                progreso_texto.text(f"Procesando archivo {i} de {total_archivos}: {file_name}")
-
-                # Pequeña pausa para refrescar la interfaz sin congelar Streamlit
-                time.sleep(0.2)
-
-            progreso_texto.text("✅ Procesamiento completo.")
-            progreso.progress(1.0)
-
-            # Crear log de modificaciones
-            log_path = os.path.join(arquetipo_path, "log_modificaciones.txt")
-            with open(log_path, "w", encoding="utf-8") as log_file:
-                log_file.write("🧠 Registro de archivos modificados en el arquetipo Mulesoft\n")
-                log_file.write("==========================================================\n\n")
-                for file_name in modified_files:
-                    log_file.write(f"- {file_name}\n")
-                log_file.write("\n\nResumen del proceso:\n")
-                log_file.write(result_log)
-
-            st.success("🎉 Archivos relevantes reescritos exitosamente.")
-            st.text_area("📄 Detalle de modificaciones", result_log, height=300)
-
-            # Comprimir en ZIP
-            output_zip_path = os.path.join(temp_dir, "proyecto_generado.zip")
-            shutil.make_archive(output_zip_path.replace(".zip", ""), 'zip', arquetipo_path)
-
-            # Descargar resultado
-            with open(output_zip_path, "rb") as f:
-                st.download_button(
-                    label="⬇️ Descargar Proyecto Generado (.zip)",
-                    data=f,
-                    file_name="proyecto_generado.zip",
-                    mime="application/zip"
-                )
-
-            st.info("🗒️ Se añadió un archivo `log_modificaciones.txt` dentro del ZIP con el registro detallado de cambios.")
+                response_text = "🎉 Proyecto Mulesoft generado con éxito. Puedes descargar el ZIP con los archivos actualizados."
+                message_placeholder.markdown(response_text)
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
