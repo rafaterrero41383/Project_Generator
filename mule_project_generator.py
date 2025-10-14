@@ -8,7 +8,7 @@ from docx import Document
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# --- Configuración inicial ---
+# --- Configuración inicial --
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 st.set_page_config(page_title="Generador de Proyectos Mulesoft", layout="wide")
