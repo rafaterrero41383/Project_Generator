@@ -87,7 +87,7 @@ with chat_container:
             unsafe_allow_html=True
         )
 
-# --- Lógica de procesamiento ---
+# --- Lógica de procesamiento --
 if st.session_state.processing_triggered:
     with st.spinner("Generando el proyecto... por favor, espera."):
         time.sleep(3)  # Simulación
