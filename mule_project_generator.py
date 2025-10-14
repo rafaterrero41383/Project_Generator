@@ -14,7 +14,7 @@ from openai import OpenAI
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-st.set_page_config(page_title="ChatMuleGPT", layout="centered")
+st.set_page_config(page_title="Generador de Proyectos Mulesoft", layout="centered")
 
 # --- CSS visual ---
 st.markdown("""
@@ -28,7 +28,7 @@ body {
     background-color: #fff;
     border-radius: 20px;
     box-shadow: 0 8px 25px rgba(0,0,0,0.08);
-    padding: 40px 50px;
+    padding: 60px 50px; /* más alto para que la barra quede más abajo */
     margin-top: 40px;
     max-width: 900px;
     margin-left: auto;
@@ -38,9 +38,12 @@ body {
 /* Contenedor del clip */
 .clip-wrapper {
     position: relative;
-    width: 54px;
-    height: 54px;
-    margin-top: 10px;
+    width: 42px;  /* reducido para alineación con barra */
+    height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 2px;
 }
 
 /* Imagen del clip */
@@ -51,28 +54,12 @@ body {
     object-fit: cover;
     transition: transform 0.2s ease-in-out;
     box-shadow: 0 3px 8px rgba(0,0,0,0.1);
+    cursor: pointer;
 }
 
-/* Hover */
+/* Hover animado */
 .clip-img:hover {
     transform: scale(1.05);
-}
-
-/* Estado cargado */
-.clip-img.uploaded {
-    filter: hue-rotate(80deg) brightness(1.2);
-}
-
-/* Input invisible (área clicable real) */
-.upload-overlay input[type="file"] {
-    position: absolute;
-    opacity: 0;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    cursor: pointer;
-    z-index: 10;
 }
 
 /* Check animado */
@@ -96,26 +83,35 @@ body {
 
 /* Ocultar uploader nativo */
 div[data-testid="stFileUploader"] {
-    height: 0 !important;
-    overflow: hidden !important;
-    visibility: hidden !important;
+    position: absolute;
+    opacity: 0;
+    width: 42px;
+    height: 42px;
+    cursor: pointer;
+    z-index: 10;
 }
 
 /* Espaciado del input */
 [data-testid="stChatInput"] {
-    margin-top: 20px;
+    margin-top: 30px;
 }
 </style>
 """, unsafe_allow_html=True)
 
 # --- Encabezado ---
-st.title("🤖 ChatMuleGPT – Generador de Proyectos Mulesoft")
-st.caption("Sube tu archivo `.raml` o `.docx` con el 📎 y conversa con el asistente mientras genera tu proyecto.")
+st.markdown("""
+<div style="text-align: center; margin-top: -30px;">
+    <h1 style="font-size: 40px;">🤖 Generador de Proyectos Mulesoft</h1>
+    <p style="color: #666; font-size: 18px; margin-top: 10px;">
+        Carga tu archivo <code>.raml</code> o <code>.docx</code> para empezar a generar el proyecto.
+    </p>
+</div>
+""", unsafe_allow_html=True)
 
 # --- Contenedor principal ---
 st.markdown('<div class="main-window">', unsafe_allow_html=True)
 
-# --- Estado global ---
+# --- Estado global seguro ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "uploaded_file" not in st.session_state:
@@ -129,25 +125,22 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 # --- Layout del chat ---
-col1, col2 = st.columns([0.1, 0.9])
+col1, col2 = st.columns([0.07, 0.93])
 
 with col1:
     st.markdown('<div class="clip-wrapper">', unsafe_allow_html=True)
 
     # Clip visible (imagen)
-    clip_class = "clip uploaded" if st.session_state.uploaded_file else "clip"
-    # Buscar automáticamente el ícono (png o jpeg)
     possible_icons = ["clip_icon.png", "clip.jpeg", "clip.jpg"]
     icon_path = next((f for f in possible_icons if os.path.exists(f)), None)
 
-    if icon_path is None:
-        st.warning(
-            "⚠️ No se encontró la imagen del clip. Asegúrate de tener 'clip.jpeg' o 'clip_icon.png' en la raíz del proyecto.")
-    else:
+    if icon_path:
         img = Image.open(icon_path)
         st.image(img, use_container_width=True)
+    else:
+        st.warning("⚠️ No se encontró la imagen del clip. Asegúrate de tener 'clip.jpeg' o 'clip_icon.png' en la raíz del proyecto.")
 
-    # Overlay invisible clicable
+    # File uploader (funcional al hacer clic en el área del clip)
     uploaded = st.file_uploader("", type=["raml", "docx"], label_visibility="collapsed", key="uploader")
 
     if uploaded:
