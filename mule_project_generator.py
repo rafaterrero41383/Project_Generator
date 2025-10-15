@@ -1,8 +1,9 @@
 import os
-import zipfile
 import tempfile
-import time
-import textwrap
+import zipfile
+import re
+import xml.etree.ElementTree as ET
+import yaml
 from docx import Document
 import streamlit as st
 from dotenv import load_dotenv
@@ -11,9 +12,10 @@ from openai import OpenAI
 # === CONFIGURACIÓN INICIAL ===
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 st.set_page_config(page_title="🤖 Generador Inteligente de Proyectos Mulesoft", layout="wide")
 
-# === CSS VISUAL ===
+# === CSS Y ESTILO DE CHAT ===
 st.markdown("""
 <style>
     .st-emotion-cache-16txtl3, #MainMenu { display: none; }
@@ -31,14 +33,15 @@ st.markdown("""
 # === ESTADO GLOBAL ===
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "processing" not in st.session_state:
-    st.session_state.processing = False
-if "uploaded_file" not in st.session_state:
-    st.session_state.uploaded_file = None
+if "uploaded_spec" not in st.session_state:
+    st.session_state.uploaded_spec = None
+if "generated_zip" not in st.session_state:
+    st.session_state.generated_zip = None
 
 assistant_avatar = "https://cdn-icons-png.flaticon.com/512/4712/4712109.png"
 user_avatar = "https://cdn-icons-png.flaticon.com/512/1077/1077012.png"
 
+# === TÍTULO CENTRADO ===
 st.markdown("<h1 style='text-align:center;'>🤖 Generador Inteligente de Proyectos Mulesoft</h1>", unsafe_allow_html=True)
 
 # === BOTÓN DE REINICIO ===
@@ -47,19 +50,232 @@ if st.button("🔄 Reiniciar aplicación"):
         del st.session_state[k]
     st.rerun()
 
-# === CARGA DE ARCHIVO ===
-uploaded = st.file_uploader("📎 Adjunta tu especificación (RAML o DTM .docx)", type=["raml", "docx"])
-if uploaded:
-    if not st.session_state.uploaded_file or st.session_state.uploaded_file["name"] != uploaded.name:
-        st.session_state.uploaded_file = {"name": uploaded.name, "content": uploaded.read()}
+# === CARGA DE ESPECIFICACIÓN ===
+spec = st.file_uploader("📎 Adjunta la especificación (RAML o DTM .docx)", type=["raml", "docx"])
+if spec and st.session_state.uploaded_spec is None:
+    st.session_state.uploaded_spec = spec
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": f"📄 Archivo `{spec.name}` cargado correctamente. Escribe en el chat `Crea el proyecto` para comenzar."
+    })
+
+# === FUNCIONES ===
+
+def leer_especificacion(file):
+    name = file.name.lower()
+    if name.endswith(".raml"):
+        return file.read().decode("utf-8", errors="ignore")
+    elif name.endswith(".docx"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            tmp.write(file.read())
+            tmp_path = tmp.name
+        doc = Document(tmp_path)
+        return "\n".join([p.text for p in doc.paragraphs])
+    return ""
+
+
+def obtener_arquetipo():
+    for f in os.listdir():
+        if f.endswith(".zip") and "arquetipo" in f.lower():
+            return f
+    return None
+
+
+def inferir_metadatos(contenido_api):
+    prompt = f"""Eres un generador de proyectos Mulesoft.
+Analiza la siguiente especificación (RAML o DTM) y devuelve metadatos clave en formato YAML:
+
+- api_name
+- tipo_api (System, Process, Experience)
+- version
+- descripcion
+- endpoints
+- dependencias
+
+Especificación:
+---
+{contenido_api}
+---
+"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Eres un experto en arquitectura Mulesoft."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error al inferir metadatos: {e}"
+
+
+def limpiar_contenido_bruto(raw_output):
+    code_blocks = re.findall(r"```(?:xml|yaml|yml|json|properties)?(.*?)```", raw_output, re.DOTALL)
+    if code_blocks:
+        return code_blocks[-1].strip()
+
+    start = raw_output.find("<")
+    if start != -1:
+        return raw_output[start:].strip()
+    return raw_output.strip()
+
+
+# === VALIDADORES ===
+
+def validar_xml(contenido, archivo):
+    try:
+        ET.fromstring(contenido)
+        return None
+    except ET.ParseError as e:
+        return f"❌ {archivo}: Error XML → {e}"
+
+def validar_yaml(contenido, archivo):
+    try:
+        yaml.safe_load(contenido)
+        return None
+    except yaml.YAMLError as e:
+        return f"⚠️ {archivo}: Error YAML → {e}"
+
+
+def procesar_arquetipo(arquetipo_zip, metadatos_yaml):
+    temp_dir = tempfile.mkdtemp()
+    output_zip = os.path.join(tempfile.gettempdir(), "proyecto_mulesoft_generado.zip")
+
+    with zipfile.ZipFile(arquetipo_zip, "r") as zip_ref:
+        zip_ref.extractall(temp_dir)
+
+    archivos_modificados = []
+    errores_validacion = []
+    archivos_totales = sum(len(files) for _, _, files in os.walk(temp_dir))
+    progreso = st.progress(0)
+    procesados = 0
+
+    for root, _, files in os.walk(temp_dir):
+        for file in files:
+            procesados += 1
+            progreso.progress(procesados / archivos_totales)
+            ruta = os.path.join(root, file)
+            ext = os.path.splitext(file)[1].lower()
+
+            if ext in [".xml", ".json", ".yaml", ".yml", ".raml", ".properties", ".txt", ".pom", ".md"]:
+                try:
+                    with open(ruta, "r", encoding="utf-8", errors="ignore") as f:
+                        original = f.read()
+
+                    prompt_archivo = f"""Eres un configurador de proyectos Mulesoft.
+Usa los siguientes metadatos inferidos:
+---
+{metadatos_yaml}
+---
+Actualiza el siguiente archivo ({file}) reemplazando placeholders genéricos con valores coherentes según los metadatos.
+Responde **solo con el contenido actualizado del archivo**, sin comentarios, sin explicaciones ni texto adicional.
+Mantén el formato original.
+Archivo original:
+{original}
+Archivo actualizado:
+"""
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "Eres un configurador experto en Mulesoft."},
+                            {"role": "user", "content": prompt_archivo}
+                        ],
+                        temperature=0.3
+                    )
+                    raw_output = response.choices[0].message.content.strip()
+                    nuevo_contenido = limpiar_contenido_bruto(raw_output)
+
+                    # === Validación de formato antes de guardar ===
+                    if ext in [".xml", ".pom"]:
+                        error = validar_xml(nuevo_contenido, file)
+                        if error: errores_validacion.append(error)
+                    elif ext in [".yaml", ".yml"]:
+                        error = validar_yaml(nuevo_contenido, file)
+                        if error: errores_validacion.append(error)
+
+                    with open(ruta, "w", encoding="utf-8") as f:
+                        f.write(nuevo_contenido)
+                    archivos_modificados.append(file)
+
+                except Exception as e:
+                    errores_validacion.append(f"⚠️ Error al procesar {file}: {e}")
+
+    # Crear el ZIP final
+    with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for root, _, files in os.walk(temp_dir):
+            for file in files:
+                full_path = os.path.join(root, file)
+                arcname = os.path.relpath(full_path, temp_dir)
+                zipf.write(full_path, arcname)
+
+    progreso.progress(1.0)
+    return output_zip, archivos_modificados, errores_validacion
+
+
+def manejar_mensaje(user_input):
+    user_input = user_input.lower().strip()
+
+    if user_input in ["crear proyecto", "crea el proyecto", "genera el proyecto"]:
+        if not st.session_state.uploaded_spec:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "⚠️ Primero carga un archivo RAML o DTM antes de generar el proyecto."
+            })
+            return
+
+        arquetipo = obtener_arquetipo()
+        if not arquetipo:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "❌ No se encontró ningún archivo ZIP con 'arquetipo' en la raíz del proyecto."
+            })
+            return
+
         st.session_state.messages.append({
             "role": "assistant",
-            "content": f"📁 Archivo `{uploaded.name}` cargado correctamente. Describe qué tipo de API deseas generar (System, Process o Experience)."
+            "content": "🧠 Analizando la especificación..."
         })
-        st.rerun()
 
-# === CONTENEDOR DEL CHAT ===
-with st.container():
+        contenido = leer_especificacion(st.session_state.uploaded_spec)
+        metadatos = inferir_metadatos(contenido)
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": f"📘 Metadatos inferidos:\n```\n{metadatos}\n```"
+        })
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "⚙️ Configurando proyecto con el arquetipo..."
+        })
+
+        salida_zip, modificados, errores = procesar_arquetipo(arquetipo, metadatos)
+        st.session_state.generated_zip = salida_zip
+
+        msg = f"✅ Proyecto generado correctamente con {len(modificados)} archivos modificados."
+        if errores:
+            msg += "\n\n⚠️ Se detectaron algunos problemas de validación:\n" + "\n".join(errores[:5])
+            if len(errores) > 5:
+                msg += f"\n... y {len(errores) - 5} errores más."
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": msg
+        })
+
+    else:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "💬 Entendido. Escribe `Crea el proyecto` para generar tu proyecto Mulesoft."
+        })
+
+
+# === HISTORIAL DEL CHAT ===
+chat_container = st.container()
+
+with chat_container:
     for msg in st.session_state.messages:
         avatar = user_avatar if msg["role"] == "user" else assistant_avatar
         bubble_class = "user-bubble" if msg["role"] == "user" else "assistant-bubble"
@@ -72,177 +288,20 @@ with st.container():
             unsafe_allow_html=True
         )
 
+# === ENTRADA DE CHAT ===
+user_input = st.chat_input("Escribe aquí...")
 
-# === FUNCIÓN: LEER ESPECIFICACIÓN ===
-def leer_especificacion(uploaded_file):
-    name = uploaded_file["name"].lower()
-    if name.endswith(".raml"):
-        return uploaded_file["content"].decode("utf-8", errors="ignore")
-    elif name.endswith(".docx"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-            tmp.write(uploaded_file["content"])
-            tmp_path = tmp.name
-        doc = Document(tmp_path)
-        return "\n".join([p.text for p in doc.paragraphs])
-    return ""
-
-
-# === FUNCIÓN PRINCIPAL ===
-def generar_proyecto(prompt_text, user_file):
-    archetype_zip = None
-    for f in os.listdir():
-        if f.endswith(".zip") and "arquetipo" in f.lower():
-            archetype_zip = f
-            break
-
-    if not archetype_zip:
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": "❌ Error: No se encontró un archivo .zip de arquetipo Mulesoft en la raíz del proyecto."
-        })
-        st.rerun()
-        return
-
-    user_text = leer_especificacion(user_file)
-
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": "🧠 Analizando la especificación del archivo para extraer metadatos del proyecto..."
-    })
-    st.rerun()
-    time.sleep(1)
-
-    # === Extraer metadatos del RAML o DTM ===
-    base_prompt = (
-        textwrap.dedent(
-            "Eres un generador de proyectos Mulesoft.\n"
-            "Analiza la siguiente especificación (RAML o DTM) y extrae información relevante:\n"
-            "- Nombre del proyecto (api_name)\n"
-            "- Tipo de API (System, Process, Experience)\n"
-            "- Versión\n"
-            "- Descripción\n"
-            "- Endpoints principales\n"
-            "- Dependencias y conectores\n\n"
-            "Escribe los valores inferidos en formato YAML.\n"
-            "---\n"
-        )
-        + user_text
-        + "\n"
-    )
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Eres un experto en arquitectura Mulesoft."},
-                {"role": "user", "content": base_prompt}
-            ],
-            temperature=0.2
-        )
-        inferred_data = response.choices[0].message.content.strip()
-    except Exception as e:
-        inferred_data = f"Error al analizar: {e}"
-
-    # === Descomprimir arquetipo ===
-    temp_dir = tempfile.mkdtemp()
-    with zipfile.ZipFile(archetype_zip, "r") as zip_ref:
-        zip_ref.extractall(temp_dir)
-
-    modified_files = []
-
-    # === Procesar cada archivo ===
-    for root, _, files in os.walk(temp_dir):
-        for file in files:
-            file_path = os.path.join(root, file)
-            ext = os.path.splitext(file)[1].lower()
-            if ext in [".xml", ".json", ".yaml", ".yml", ".txt", ".md", ".raml", ".properties", ".pom"]:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    original_content = f.read()
-
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": f"🧩 Procesando archivo: `{file}` ..."
-                })
-                st.rerun()
-                time.sleep(0.3)
-
-                prompt_file = (
-                    textwrap.dedent(
-                        "Eres un configurador de proyectos Mulesoft.\n"
-                        "Usa los siguientes metadatos inferidos del usuario:\n"
-                        "---\n"
-                    )
-                    + inferred_data
-                    + textwrap.dedent(
-                        "---\n"
-                        f"Actualiza el siguiente archivo ({file}) reemplazando valores genéricos "
-                        "(nombres, versiones, rutas, descripciones) con la información inferida.\n\n"
-                        "Archivo original:\n"
-                        "```\n"
-                    )
-                    + original_content
-                    + textwrap.dedent(
-                        "```\n"
-                        "Archivo actualizado:\n"
-                    )
-                )
-
-                try:
-                    resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[
-                            {"role": "system", "content": "Eres un configurador experto en Mulesoft."},
-                            {"role": "user", "content": prompt_file}
-                        ],
-                        temperature=0.3
-                    )
-                    updated_content = resp.choices[0].message.content.strip()
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(updated_content)
-                    modified_files.append(file)
-
-                except Exception as e:
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": f"⚠️ Error al modificar `{file}`: {e}"
-                    })
-                    st.rerun()
-
-    # === Generar ZIP final ===
-    output_zip = os.path.join(tempfile.gettempdir(), "proyecto_mulesoft_generado.zip")
-    with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(temp_dir):
-            for file in files:
-                full_path = os.path.join(root, file)
-                arcname = os.path.relpath(full_path, temp_dir)
-                zipf.write(full_path, arcname)
-
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": f"✅ Proyecto generado exitosamente con {len(modified_files)} archivos modificados."
-    })
-
-    with open(output_zip, "rb") as f:
-        st.session_state.generated_zip = f.read()
-
-
-# === DESCARGA ===
-if "generated_zip" in st.session_state and st.session_state.generated_zip:
-    st.download_button(
-        "⬇️ Descargar Proyecto Mulesoft (.zip)",
-        st.session_state.generated_zip,
-        "proyecto_mulesoft_generado.zip",
-        "application/zip"
-    )
-    del st.session_state.generated_zip
-
-# === CHAT INPUT ===
-user_input = st.chat_input("Describe el tipo de API o los detalles del proyecto...")
 if user_input:
-    if not st.session_state.uploaded_file:
-        st.toast("⚠️ Primero adjunta un archivo de especificación (RAML o DTM).", icon="⚠️")
-    else:
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        st.session_state.processing = True
-        generar_proyecto(user_input, st.session_state.uploaded_file)
-        st.rerun()
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    manejar_mensaje(user_input)
+    st.rerun()
+
+# === DESCARGA DEL ZIP FINAL ===
+if st.session_state.generated_zip:
+    with open(st.session_state.generated_zip, "rb") as f:
+        st.download_button(
+            "⬇️ Descargar Proyecto Mulesoft (.zip)",
+            f,
+            "proyecto_mulesoft_generado.zip",
+            "application/zip"
+        )
