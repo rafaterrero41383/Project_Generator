@@ -2,6 +2,12 @@ import os
 import tempfile
 import zipfile
 import re
+# --- Parche para compatibilidad con Python 3.13 ---
+import sys, types
+if 'imghdr' not in sys.modules:
+    imghdr = types.ModuleType("imghdr")
+    sys.modules['imghdr'] = imghdr
+# ---------------------------------------------------
 import xml.etree.ElementTree as ET
 import yaml
 from docx import Document
