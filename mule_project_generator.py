@@ -110,22 +110,25 @@ def generar_proyecto(prompt_text, user_file):
         "content": "🧠 Analizando la especificación del archivo para extraer metadatos del proyecto..."
     })
     st.rerun()
-
     time.sleep(1)
 
     # === Extraer metadatos del RAML o DTM ===
-    base_prompt = textwrap.dedent(
-        "Eres un generador de proyectos Mulesoft.\n"
-        "Analiza la siguiente especificación (RAML o DTM) y extrae información relevante:\n"
-        "- Nombre del proyecto (api_name)\n"
-        "- Tipo de API (System, Process, Experience)\n"
-        "- Versión\n"
-        "- Descripción\n"
-        "- Endpoints principales\n"
-        "- Dependencias y conectores\n\n"
-        "Escribe los valores inferidos en formato YAML.\n"
-        "---\n"
-    ) + user_text + "\n"
+    base_prompt = (
+        textwrap.dedent(
+            "Eres un generador de proyectos Mulesoft.\n"
+            "Analiza la siguiente especificación (RAML o DTM) y extrae información relevante:\n"
+            "- Nombre del proyecto (api_name)\n"
+            "- Tipo de API (System, Process, Experience)\n"
+            "- Versión\n"
+            "- Descripción\n"
+            "- Endpoints principales\n"
+            "- Dependencias y conectores\n\n"
+            "Escribe los valores inferidos en formato YAML.\n"
+            "---\n"
+        )
+        + user_text
+        + "\n"
+    )
 
     try:
         response = client.chat.completions.create(
@@ -163,19 +166,25 @@ def generar_proyecto(prompt_text, user_file):
                 st.rerun()
                 time.sleep(0.3)
 
-                prompt_file = textwrap.dedent(
-                    "Eres un configurador de proyectos Mulesoft.\n"
-                    "Usa los siguientes metadatos inferidos del usuario:\n"
-                    "---\n"
-                ) + inferred_data + textwrap.dedent(
-                    "---\n"
-                    f"Actualiza el siguiente archivo ({file}) reemplazando valores genéricos "
-                    "(nombres, versiones, rutas, descripciones) con la información inferida.\n\n"
-                    "Archivo original:\n"
-                    "```\n"
-                ) + original_content + textwrap.dedent(
-                    "```\n"
-                    "Archivo actualizado:\n"
+                prompt_file = (
+                    textwrap.dedent(
+                        "Eres un configurador de proyectos Mulesoft.\n"
+                        "Usa los siguientes metadatos inferidos del usuario:\n"
+                        "---\n"
+                    )
+                    + inferred_data
+                    + textwrap.dedent(
+                        "---\n"
+                        f"Actualiza el siguiente archivo ({file}) reemplazando valores genéricos "
+                        "(nombres, versiones, rutas, descripciones) con la información inferida.\n\n"
+                        "Archivo original:\n"
+                        "```\n"
+                    )
+                    + original_content
+                    + textwrap.dedent(
+                        "```\n"
+                        "Archivo actualizado:\n"
+                    )
                 )
 
                 try:
@@ -217,23 +226,23 @@ def generar_proyecto(prompt_text, user_file):
         st.session_state.generated_zip = f.read()
 
 
-    # === DESCARGA ===
-    if "generated_zip" in st.session_state and st.session_state.generated_zip:
-        st.download_button(
-            "⬇️ Descargar Proyecto Mulesoft (.zip)",
-            st.session_state.generated_zip,
-            "proyecto_mulesoft_generado.zip",
-            "application/zip"
-        )
-        del st.session_state.generated_zip
+# === DESCARGA ===
+if "generated_zip" in st.session_state and st.session_state.generated_zip:
+    st.download_button(
+        "⬇️ Descargar Proyecto Mulesoft (.zip)",
+        st.session_state.generated_zip,
+        "proyecto_mulesoft_generado.zip",
+        "application/zip"
+    )
+    del st.session_state.generated_zip
 
-    # === CHAT INPUT ===
-    user_input = st.chat_input("Describe el tipo de API o los detalles del proyecto...")
-    if user_input:
-        if not st.session_state.uploaded_file:
-            st.toast("⚠️ Primero adjunta un archivo de especificación (RAML o DTM).", icon="⚠️"),
-        else:
-            st.session_state.messages.append({"role": "user", "content": user_input})
-            st.session_state.processing = True
-            generar_proyecto(user_input, st.session_state.uploaded_file)
-            st.rerun()
+# === CHAT INPUT ===
+user_input = st.chat_input("Describe el tipo de API o los detalles del proyecto...")
+if user_input:
+    if not st.session_state.uploaded_file:
+        st.toast("⚠️ Primero adjunta un archivo de especificación (RAML o DTM).", icon="⚠️")
+    else:
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        st.session_state.processing = True
+        generar_proyecto(user_input, st.session_state.uploaded_file)
+        st.rerun()
