@@ -1,7 +1,5 @@
-pyyaml
-pillow
-streamlit
-openai
-python-docx
-python-dotenv
-requests
+streamlit==1.30.0
+python-dotenv==1.0.1
+openai==1.13.3
+python-docx==1.1.0
+pyyaml==6.0.2
