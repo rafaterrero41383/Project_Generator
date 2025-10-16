@@ -15,8 +15,8 @@ from dotenv import load_dotenv
 import os
 from openai import OpenAI
 
-# ====== NUEVO: imports para el generador determinista ======
-import json
+# ====== NUEVO: imports para el generador determinista y parches XML ======
+import io, json
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import Dict, Optional, Iterable, Tuple, List
@@ -121,19 +121,10 @@ def validar_yaml(contenido, archivo):
 # =============== GENERADOR DETERMINISTA ====================
 # ===========================================================
 
-# Directorios/archivos a ignorar
 IGNORE_DIRS = {".git", ".hg", ".svn", ".idea", ".DS_Store", "target", ".vscode", "__MACOSX", "docs", "design"}
-# Extensiones de guía (no van al ZIP)
-GUIDE_EXTS: Iterable[str] = (
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
-    ".pdf", ".ppt", ".pptx", ".key", ".ai", ".psd"
-)
-# Extensiones de texto para render/reemplazo
-TEXT_EXTS: Iterable[str] = (
-    ".xml", ".yaml", ".yml", ".json", ".md", ".txt",
-    ".properties", ".pom", ".cfg", ".ini", ".raml", ".dwl", ".policy"
-)
-# Tokens “clásicos”
+GUIDE_EXTS: Iterable[str] = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".pdf", ".ppt", ".pptx", ".key", ".ai", ".psd")
+TEXT_EXTS: Iterable[str]  = (".xml", ".yaml", ".yml", ".json", ".md", ".txt", ".properties", ".pom", ".cfg", ".ini", ".raml", ".dwl", ".policy")
+
 TOKEN_MAP = {
     "__PROJECT_NAME__": "project_name",
     "__ARTIFACT_ID__":  "artifact_id",
@@ -160,14 +151,18 @@ def is_text_file(path: Path) -> bool:
         return False
 
 def jinja_env(root: Path) -> Environment:
-    return Environment(
-        loader=FileSystemLoader(str(root)),
-        undefined=StrictUndefined,   # fail-fast si falta un placeholder
-        keep_trailing_newline=True,
-        autoescape=False,
-    )
+    return Environment(loader=FileSystemLoader(str(root)), undefined=StrictUndefined, keep_trailing_newline=True, autoescape=False)
 
 def first_raml_target(dst_root: Path) -> Path:
+    # 1) target “oficial” del arquetipo
+    candidate = dst_root / "src/main/resources/api/starwars.raml"
+    if candidate.exists() or candidate.parent.exists():
+        return candidate
+    # 2) fallback a api.raml si no existe starwars.raml
+    candidate2 = dst_root / "src/main/resources/api/api.raml"
+    if candidate2.parent.exists():
+        return candidate2
+    # 3) último recurso: primer .raml que encontremos
     existing = list(dst_root.rglob("*.raml"))
     return existing[0] if existing else (dst_root / "src/main/resources/api/api.raml")
 
@@ -178,12 +173,303 @@ def should_skip(path: Path, include_guides: bool) -> bool:
         return True
     return False
 
-def render_or_copy(src: Path, dst: Path, env: Environment, ctx: Dict, token_replace: bool):
-    """Copia/renderiza un archivo del arquetipo aplicando:
-       1) Jinja2 en *.j2
-       2) Reemplazos de tokens clásicos
-       3) Ajustes típicos en YAML/JSON si faltan valores (app.name, api.baseUri, mule-artifact.json name)
+# ===================== PARSEO/CTX DESDE RAML o DTM =====================
+
+RAML_HEADER_MARK = "#%RAML"
+
+def parse_raml_text(txt: str) -> dict:
+    data = {"title": None, "version": None, "baseUri": None, "protocols": None, "mediaType": None, "endpoints": []}
+    lines = [l.rstrip() for l in txt.splitlines()]
+    header_done = False
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if i == 0 and line.startswith(RAML_HEADER_MARK):
+            continue
+        if line.startswith("types:") or line.startswith("documentation:") or line.startswith("/"):
+            header_done = True
+        if not header_done:
+            m = re.match(r'^([A-Za-z][A-Za-z0-9_-]*):\s*(.+)?$', line.strip())
+            if m:
+                k, v = m.group(1), m.group(2)
+                if v and v.strip().startswith("[") and v.strip().endswith("]"):
+                    try:
+                        vv = v.strip().strip("[]").replace(" ", "")
+                        data[k] = [x for x in vv.split(",") if x]
+                    except Exception:
+                        data[k] = v
+                else:
+                    data[k] = v
+        else:
+            if line.strip().startswith("/"):
+                ep = line.strip().split(":")[0].strip()
+                if ep:
+                    data["endpoints"].append(ep)
+    return {
+        "title": data.get("title"),
+        "version": data.get("version") or None,
+        "baseUri": data.get("baseUri"),
+        "protocols": data.get("protocols"),
+        "mediaType": data.get("mediaType"),
+        "endpoints": data.get("endpoints") or [],
+    }
+
+def parse_docx_kv(txt: str) -> dict:
+    kv = {}
+    for line in txt.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if k and v:
+                kv[k] = v
+    title = kv.get("title") or kv.get("nombre api") or kv.get("api name") or kv.get("servicio") or kv.get("microservicio")
+    version = kv.get("version") or kv.get("versión") or kv.get("api version") or "1.0.0"
+    base_uri = kv.get("baseuri") or kv.get("base uri") or kv.get("base_url") or kv.get("endpoint base")
+    group_id = kv.get("group_id") or kv.get("grupo maven") or "com.company.experience"
+    return {"title": title, "version": version, "baseUri": base_uri, "group_id": group_id, "raw": kv}
+
+def derive_fields(title: str, version: str, base_uri: str, group_id: str, endpoints: List[str]) -> dict:
+    def _kebab(s: str) -> str:
+        s = re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-")
+        return re.sub(r"-{2,}", "-", s).lower()
+    project_name = title or "MuleApplication"
+    artifact_id = _kebab(project_name)
+    v = version or "1.0.0"
+    host_name = None; protocol = None; base_path = None
+    if base_uri:
+        try:
+            if "{" in base_uri and "}" in base_uri:
+                protocol = "HTTPS" if base_uri.lower().startswith("https") else "HTTP"
+                after_host = base_uri.split("}", 1)[-1] or "/"
+                base_path = after_host
+            else:
+                u = urlparse(base_uri)
+                protocol = (u.scheme or "HTTP").upper()
+                host_name = u.netloc or None
+                base_path = u.path or "/"
+        except Exception:
+            pass
+    # endpoint por defecto (el primero que no sea /healthcheck)
+    api_endpoint = None
+    for ep in endpoints or []:
+        if "healthcheck" not in ep.lower():
+            api_endpoint = ep
+            break
+    if not api_endpoint and base_path:
+        api_endpoint = base_path if base_path.startswith("/") else f"/{base_path}"
+    general_path = api_endpoint or (base_path if base_path else "/")
+    return {
+        "project_name": project_name,
+        "artifact_id": artifact_id,
+        "version": v,
+        "group_id": group_id or "com.company.experience",
+        "base_uri": base_uri or None,
+        "host_name": host_name,
+        "protocol": protocol,              # "HTTP"/"HTTPS"
+        "base_path": base_path.lstrip("/") if base_path else None,
+        "general_path": general_path,      # para listener/path
+        # variables “starwars.*” heredadas del arquetipo:
+        "starwars_host": host_name,
+        "starwars_protocol": protocol,
+        "starwars_path": api_endpoint or general_path,
+    }
+
+def build_context_from_spec(spec_file, raw_text: str) -> dict:
+    name = spec_file.name.lower()
+    if name.endswith(".raml") or raw_text.strip().startswith(RAML_HEADER_MARK):
+        r = parse_raml_text(raw_text)
+        ctx = derive_fields(
+            r.get("title") or "MuleApplication",
+            r.get("version") or "1.0.0",
+            r.get("baseUri"),
+            "com.company.experience",
+            r.get("endpoints") or []
+        )
+        ctx.update({
+            "media_type": r.get("mediaType"),
+            "protocols": ",".join(r.get("protocols")) if isinstance(r.get("protocols"), list) else (r.get("protocols") or None),
+            "endpoints": r.get("endpoints") or [],
+        })
+        return ctx
+    else:
+        d = parse_docx_kv(raw_text)
+        ctx = derive_fields(
+            d.get("title") or "MuleApplication",
+            d.get("version") or "1.0.0",
+            d.get("baseUri"),
+            d.get("group_id") or "com.company.experience",
+            []
+        )
+        return ctx
+
+# ===================== PARCHES XML/JSON/YAML DIRIGIDOS =====================
+
+def _regex_replace_once(text: str, tag: str, new_value: str) -> str:
+    # Reemplaza PRIMERA ocurrencia <tag>...</tag> por <tag>new_value</tag>
+    pattern = re.compile(rf"(<{tag}\s*>)(.*?)(</{tag}\s*>)", re.DOTALL)
+    return pattern.sub(rf"\1{new_value}\3", text, count=1)
+
+def patch_pom_xml_preserving_format(xml_text: str, ctx: Dict) -> str:
+    # Campos raíz
+    if ctx.get("group_id"):    xml_text = _regex_replace_once(xml_text, "groupId", ctx["group_id"])
+    if ctx.get("artifact_id"): xml_text = _regex_replace_once(xml_text, "artifactId", ctx["artifact_id"])
+    if ctx.get("version"):     xml_text = _regex_replace_once(xml_text, "version", ctx["version"])
+    if ctx.get("project_name"):xml_text = _regex_replace_once(xml_text, "name", ctx["project_name"])
+    # project.mule.name
+    mule_name = ctx.get("project_name") or ctx.get("artifact_id")
+    if mule_name:
+        if re.search(r"<project\.mule\.name\s*>.*?</project\.mule\.name>", xml_text, re.DOTALL):
+            xml_text = _regex_replace_once(xml_text, "project.mule.name", mule_name)
+        elif "</properties>" in xml_text:
+            xml_text = xml_text.replace(
+                "</properties>",
+                f"  <project.mule.name>{mule_name}</project.mule.name>\n</properties>"
+            )
+    # CloudHub 2 opcional
+    def _set(tag, key):
+        nonlocal xml_text
+        if ctx.get(key) is not None and re.search(rf"<{tag}\s*>.*?</{tag}\s*>", xml_text, re.DOTALL):
+            xml_text = _regex_replace_once(xml_text, tag, str(ctx[key]))
+    for tag, key in [
+        ("environment","environment"),("businessGroupId","businessGroupId"),("target","target"),
+        ("connectedAppClientId","connectedAppClientId"),("connectedAppClientSecret","connectedAppClientSecret"),
+        ("replicas","replicas"),("vCores","vCores")
+    ]:
+        _set(tag, key)
+    # orgId en repos
+    if ctx.get("orgId"):
+        xml_text = re.sub(r"(organizations/)[^/]+(/maven)", rf"\1${{orgId}}\2", xml_text, count=1)
+        if "<orgId>" not in xml_text and "</properties>" in xml_text:
+            xml_text = xml_text.replace("</properties>", f"  <orgId>{ctx['orgId']}</orgId>\n</properties>")
+    return xml_text
+# pom.xml (comentarios y posiciones según tu archivo).  ← basado en lo que compartiste
+
+def patch_log4j2_xml(xml_text: str, ctx: Dict) -> str:
     """
+    Renombra el archivo de log al artifact_id o project_name.
+    Ejemplo original: mx-ms-bc-mulesoft-template.log  →  {artifact_id}.log
+    """
+    log_name = ctx.get("artifact_id") or ctx.get("project_name") or "application"
+    # fileName
+    xml_text = re.sub(
+        r'(fileName="\$\{sys:mule\.home\}\$\{sys:file\.separator\}logs\$\{sys:file\.separator\})[^"]+(\.log")',
+        rf'\1{log_name}\2',
+        xml_text, count=1
+    )
+    # filePattern
+    xml_text = re.sub(
+        r'(filePattern="\$\{sys:mule\.home\}\$\{sys:file\.separator\}logs\$\{sys:file\.separator\})[^"]+(-%i\.log")',
+        rf'\1{log_name}\2',
+        xml_text, count=1
+    )
+    return xml_text
+# log4j2.xml (ajusta fileName/filePattern).  :contentReference[oaicite:3]{index=3}
+
+def patch_global_config_xml(xml_text: str, ctx: Dict) -> str:
+    if ctx.get("http_port"):
+        xml_text = re.sub(r'(http:listener-connection[^>]*port=")[^"]+(")', rf'\g<1>{ctx["http_port"]}\2', xml_text)
+    if ctx.get("starwars_host"):
+        xml_text = re.sub(r'(http:request-connection[^>]*host=")[^"]+(")', rf'\g<1>{ctx["starwars_host"]}\2', xml_text, count=1)
+    if ctx.get("starwars_protocol"):
+        xml_text = re.sub(r'(http:request-connection[^>]*protocol=")[^"]+(")', rf'\g<1>{ctx["starwars_protocol"]}\2', xml_text, count=1)
+    if ctx.get("identity_basePath"):
+        xml_text = re.sub(r'(http:request-config[^>]*basePath=")[^"]+(")', rf'\g<1>{ctx["identity_basePath"]}\2', xml_text, count=1)
+    return xml_text
+
+def patch_main_flow_xml(xml_text: str, ctx: Dict) -> str:
+    # No forzamos api="api\api.raml". Este arquetipo usa api\starwars.raml.
+    # Solo si quieres literalizar el path del listener, activa ctx["general_path_literal"]=True
+    if ctx.get("general_path_literal"):
+        xml_text = re.sub(r'(http:listener[^>]*path=")[^"]+(")', rf'\g<1>{ctx["general_path"]}\2', xml_text, count=1)
+    return xml_text
+
+def patch_client_xml(xml_text: str, ctx: Dict) -> str:
+    if ctx.get("starwars_path"):
+        xml_text = re.sub(r'(http:request[^>]*path=")\$\{starwars\.path\}(")', rf'\1{ctx["starwars_path"]}\2', xml_text)
+    if ctx.get("starwars_host"):
+        xml_text = re.sub(r'(http:request-connection[^>]*host=")\$\{starwars\.host\}(")', rf'\1{ctx["starwars_host"]}\2', xml_text)
+    if ctx.get("starwars_protocol"):
+        xml_text = re.sub(r'(http:request-connection[^>]*protocol=")\$\{starwars\.protocol\}(")', rf'\1{ctx["starwars_protocol"]}\2', xml_text)
+    return xml_text
+
+def patch_validate_token_xml(xml_text: str, ctx: Dict) -> str:
+    if ctx.get("identity_host"):
+        xml_text = re.sub(r'(http:request-connection[^>]*host=")[^"]+(")', rf'\g<1>{ctx["identity_host"]}\2', xml_text, count=1)
+    if ctx.get("identity_basePath"):
+        xml_text = re.sub(r'(http:request-config[^>]*basePath=")[^"]+(")', rf'\g<1>{ctx["identity_basePath"]}\2', xml_text, count=1)
+    if ctx.get("identity_path"):
+        xml_text = re.sub(r'(http:request[^>]*path=")\$\{partyIdentify\.path\}(")', rf'\1{ctx["identity_path"]}\2', xml_text, count=1)
+    return xml_text
+
+def patch_exchange_json(json_text: str, ctx: Dict) -> str:
+    try:
+        data = json.loads(json_text)
+    except Exception:
+        return json_text
+    data["groupId"] = ctx.get("group_id") or data.get("groupId")
+    data["assetId"] = ctx.get("artifact_id") or data.get("assetId")
+    data["name"]    = ctx.get("project_name") or data.get("name")
+    data["version"] = ctx.get("version") or data.get("version")
+    # Este arquetipo usa starwars.raml como main
+    data["main"]    = "starwars.raml"
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+def patch_properties_yaml(yaml_text: str, ctx: Dict) -> str:
+    """
+    Escribe claves comunes en los properties por ambiente (dev/local/qa/prod):
+      app.name, general.path, starwars.host/protocol/path, http.port (si ctx trae http_port)
+    """
+    try:
+        y = yaml.safe_load(yaml_text) or {}
+    except Exception:
+        return yaml_text
+    if not isinstance(y, dict):
+        return yaml_text
+    # app.name
+    y.setdefault("app", {})
+    if isinstance(y["app"], dict) and not y["app"].get("name"):
+        y["app"]["name"] = ctx.get("project_name")
+    # general.path
+    if ctx.get("general_path"):
+        y.setdefault("general", {})
+        if isinstance(y["general"], dict):
+            y["general"]["path"] = ctx["general_path"]
+    # starwars.*
+    y.setdefault("starwars", {})
+    if isinstance(y["starwars"], dict):
+        if ctx.get("starwars_host"):     y["starwars"]["host"]     = ctx["starwars_host"]
+        if ctx.get("starwars_protocol"): y["starwars"]["protocol"] = ctx["starwars_protocol"]
+        if ctx.get("starwars_path"):     y["starwars"]["path"]     = ctx["starwars_path"]
+    # http.port (opcional)
+    if ctx.get("http_port"):
+        y.setdefault("http", {})
+        if isinstance(y["http"], dict):
+            y["http"]["port"] = ctx["http_port"]
+    return yaml.safe_dump(y, sort_keys=False, allow_unicode=True)
+
+def patch_generic_mule_xml(xml_text: str, filename: str, ctx: Dict) -> str:
+    """Router para aplicar parches seguros por archivo."""
+    fname = filename.lower()
+    if fname == "pom.xml":
+        return patch_pom_xml_preserving_format(xml_text, ctx)                 # pom.xml
+    if "log4j2.xml" in fname:
+        return patch_log4j2_xml(xml_text, ctx)                                # log4j2.xml  :contentReference[oaicite:5]{index=5}
+    if "global-config" in fname:
+        return patch_global_config_xml(xml_text, ctx)                         # global-config.xml
+    if "mainflow" in fname:
+        return patch_main_flow_xml(xml_text, ctx)                             # *-mainFlow.xml
+    if "client" in fname:
+        return patch_client_xml(xml_text, ctx)                                # *-client.xml
+    if "validate-token" in fname:
+        return patch_validate_token_xml(xml_text, ctx)                        # validate-token.xml
+    if "application-types.xml" in fname:
+        return xml_text  # Autogenerado por Studio; no se toca.  :contentReference[oaicite:6]{index=6}
+    return xml_text
+
+# ===================== PIPE DE RENDER/COPIA =====================
+
+def render_or_copy(src: Path, dst: Path, env: Environment, ctx: Dict, token_replace: bool):
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     # 1) Plantillas Jinja2
@@ -195,53 +481,43 @@ def render_or_copy(src: Path, dst: Path, env: Environment, ctx: Dict, token_repl
             f.write(rendered)
         return
 
-    # 2) Token replace en archivos de texto
+    # 2) Token replace + parches XML/YAML/JSON
     if is_text_file(src) and token_replace:
         with open(src, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
+
         # Reemplazos clásicos
         for token, key in TOKEN_MAP.items():
             if token in content and key in ctx:
                 content = content.replace(token, str(ctx[key]))
 
-        # 3) Ajustes comunes por tipo (XML / YAML / JSON)
-        ext = src.suffix.lower()
-        try:
-            if ext in [".yaml", ".yml"]:
-                try:
-                    y = yaml.safe_load(content) or {}
-                    if isinstance(y, dict):
-                        # app.name
-                        y.setdefault("app", {})
-                        if isinstance(y["app"], dict) and not y["app"].get("name"):
-                            y["app"]["name"] = ctx.get("project_name")
-                        # api.baseUri
-                        y.setdefault("api", {})
-                        if isinstance(y["api"], dict) and ctx.get("base_uri") and not y["api"].get("baseUri"):
-                            y["api"]["baseUri"] = ctx["base_uri"]
-                    content = yaml.safe_dump(y, sort_keys=False, allow_unicode=True)
-                except Exception:
-                    pass
-            elif ext == ".json" and src.name == "mule-artifact.json":
-                try:
-                    j = json.loads(content)
-                    if isinstance(j, dict) and not j.get("name"):
-                        j["name"] = ctx.get("project_name")
-                    content = json.dumps(j, ensure_ascii=False, indent=2)
-                except Exception:
-                    pass
-            # XML/POM: no tocamos nodos por XPath para evitar lxml; validación ligera opcional
-            # elif ext in [".xml", ".pom"]:
-            #     try:
-            #         ET.fromstring(content)
-            #     except Exception:
-            #         pass
-        finally:
-            with open(dst, "w", encoding="utf-8", newline="\n") as f:
-                f.write(content)
+        # Parches específicos para XML Mule/pom/log4j2/...
+        if src.suffix.lower() == ".xml" or src.name.lower() == "pom.xml":
+            content = patch_generic_mule_xml(content, src.name, ctx)
+
+        # exchange.json (asset de Exchange)
+        if src.suffix.lower() == ".json" and src.name.lower() == "exchange.json":
+            content = patch_exchange_json(content, ctx)                        # exchange.json  :contentReference[oaicite:7]{index=7}
+
+        # properties YAML por ambiente (dev/local/qa/prod)
+        if src.suffix.lower() in [".yaml", ".yml"] and src.name.lower().endswith("-properties.yaml"):
+            content = patch_properties_yaml(content, ctx)
+
+        # mule-artifact.json (name, por si existe)
+        if src.suffix.lower() == ".json" and src.name == "mule-artifact.json":
+            try:
+                j = json.loads(content)
+                if isinstance(j, dict) and not j.get("name"):
+                    j["name"] = ctx.get("project_name")
+                content = json.dumps(j, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        with open(dst, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
         return
 
-    # 4) Copia binaria tal cual
+    # 3) Copia binaria tal cual
     import shutil as _shutil
     _shutil.copy2(src, dst)
 
@@ -249,11 +525,9 @@ def unpack_archetype_zip_to_temp(arquetipo_zip: str) -> Path:
     tmp_dir = Path(tempfile.mkdtemp())
     with zipfile.ZipFile(arquetipo_zip, "r") as zf:
         zf.extractall(tmp_dir)
-    # Detecta carpeta raíz del arquetipo si el ZIP trae contenedor
     candidates = [p for p in tmp_dir.iterdir() if p.is_dir()]
     if len(candidates) == 1:
         return candidates[0]
-    # Si hay varias, intenta elegir la que tenga src/ o pom.xml
     for c in candidates:
         if (c / "src").exists() or (c / "pom.xml").exists():
             return c
@@ -293,166 +567,28 @@ def generate_from_archetype_zip(arquetipo_zip: str, ctx: Dict, raml_bytes: Optio
     if not os.path.exists(arquetipo_zip):
         raise FileNotFoundError(f"No se encontró el arquetipo: {arquetipo_zip}")
 
-    # 1) Descomprime arquetipo a temp y define su raíz real
     archetype_root = unpack_archetype_zip_to_temp(arquetipo_zip)
 
-    # 2) Normaliza contexto
     artifact_id = ctx.get("artifact_id") or kebab(ctx["project_name"])
     from datetime import datetime
     now = datetime.now().strftime("%Y%m%d-%H%M%S")
     ctx = {**ctx, "artifact_id": artifact_id, "created_at": datetime.now().isoformat(timespec="seconds")}
 
-    # 3) Directorio de salida intermedio
     dst_root = Path(tempfile.mkdtemp()) / f"{artifact_id}-{now}"
     dst_root.mkdir(parents=True, exist_ok=True)
 
-    # 4) Render/copiar árbol (sin imágenes/guías por defecto)
     skipped = render_tree_from_root(archetype_root, dst_root, ctx, include_guides=include_guides, token_replace=True)
 
-    # 5) Inyección RAML (si se subió)
     if raml_bytes:
         tmp_raml = Path(tempfile.mkdtemp()) / "api.raml"
         with open(tmp_raml, "wb") as f:
             f.write(raml_bytes)
         inject_raml(dst_root, tmp_raml)
 
-    # 6) Empaquetado final
     out_zip = Path(tempfile.gettempdir()) / f"{artifact_id}-{now}.zip"
     zip_dir(dst_root, out_zip)
 
     return str(out_zip), str(dst_root), len(skipped)
-
-# ===========================================================
-# ============== PARSEO Y CONTEXTO (RAML / DTM) =============
-# ===========================================================
-
-RAML_HEADER_MARK = "#%RAML"
-
-def parse_raml_text(txt: str) -> dict:
-    """Extrae campos básicos de un RAML 1.0 sencillo (heurístico)."""
-    data = {
-        "title": None,
-        "version": None,
-        "baseUri": None,
-        "protocols": None,
-        "mediaType": None,
-        "endpoints": [],
-    }
-    lines = [l.rstrip() for l in txt.splitlines()]
-
-    header_done = False
-    for i, line in enumerate(lines):
-        if not line.strip():
-            continue
-        if i == 0 and line.startswith(RAML_HEADER_MARK):
-            continue
-        if line.startswith("types:") or line.startswith("documentation:") or line.startswith("/"):
-            header_done = True
-        if not header_done:
-            m = re.match(r'^([A-Za-z][A-Za-z0-9_-]*):\s*(.+)?$', line.strip())
-            if m:
-                k, v = m.group(1), m.group(2)
-                if v and v.strip().startswith("[") and v.strip().endswith("]"):
-                    try:
-                        vv = v.strip().strip("[]").replace(" ", "")
-                        data[k] = [x for x in vv.split(",") if x]
-                    except Exception:
-                        data[k] = v
-                else:
-                    data[k] = v
-        else:
-            if line.strip().startswith("/"):
-                ep = line.strip().split(":")[0].strip()
-                if ep:
-                    data["endpoints"].append(ep)
-
-    return {
-        "title": data.get("title"),
-        "version": (data.get("version") or None),
-        "baseUri": data.get("baseUri"),
-        "protocols": data.get("protocols"),
-        "mediaType": data.get("mediaType"),
-        "endpoints": data.get("endpoints") or [],
-    }
-
-def parse_docx_kv(txt: str) -> dict:
-    """Del DTM (DOCX->texto), detecta pares clave: valor y heurísticas básicas."""
-    kv = {}
-    for line in txt.splitlines():
-        if ":" in line:
-            k, v = line.split(":", 1)
-            k = k.strip().lower()
-            v = v.strip()
-            if k and v:
-                kv[k] = v
-
-    title = kv.get("title") or kv.get("nombre api") or kv.get("api name") or kv.get("servicio") or kv.get("microservicio")
-    version = kv.get("version") or kv.get("versión") or kv.get("api version") or "1.0.0"
-    base_uri = kv.get("baseuri") or kv.get("base uri") or kv.get("base_url") or kv.get("endpoint base")
-    group_id = kv.get("group_id") or kv.get("grupo maven") or "com.company.experience"
-
-    return {
-        "title": title,
-        "version": version,
-        "baseUri": base_uri,
-        "group_id": group_id,
-        "raw": kv
-    }
-
-def derive_fields(title: str, version: str, base_uri: str, group_id: str) -> dict:
-    project_name = title or "MuleApplication"
-    artifact_id = kebab(project_name)
-    v = version or "1.0.0"
-    base = base_uri or ""
-    host_name = None
-    base_path = None
-    if base:
-        try:
-            if "{" in base and "}" in base:
-                after_host = base.split("}", 1)[-1]
-                base_path = after_host if after_host else None
-            else:
-                u = urlparse(base)
-                host_name = u.netloc or None
-                base_path = u.path if u.path else None
-        except Exception:
-            pass
-    return {
-        "project_name": project_name,
-        "artifact_id": artifact_id,
-        "version": v,
-        "group_id": group_id or "com.company.experience",
-        "base_uri": base or None,
-        "host_name": host_name,
-        "base_path": base_path.lstrip("/") if base_path else None,
-    }
-
-def build_context_from_spec(spec_file, raw_text: str) -> dict:
-    """Detecta RAML o DTM (docx->texto) y arma el contexto completo."""
-    name = spec_file.name.lower()
-    if name.endswith(".raml") or raw_text.strip().startswith(RAML_HEADER_MARK):
-        r = parse_raml_text(raw_text)
-        ctx = derive_fields(
-            r.get("title") or "MuleApplication",
-            r.get("version") or "1.0.0",
-            r.get("baseUri"),
-            "com.company.experience",
-        )
-        ctx.update({
-            "media_type": r.get("mediaType"),
-            "protocols": ",".join(r.get("protocols")) if isinstance(r.get("protocols"), list) else (r.get("protocols") or None),
-            "endpoints": r.get("endpoints") or [],
-        })
-        return ctx
-    else:
-        d = parse_docx_kv(raw_text)
-        ctx = derive_fields(
-            d.get("title") or "MuleApplication",
-            d.get("version") or "1.0.0",
-            d.get("baseUri"),
-            d.get("group_id") or "com.company.experience",
-        )
-        return ctx
 
 # ===========================================================
 # =================== FLUJO DE MENSAJES =====================
@@ -482,7 +618,10 @@ def manejar_mensaje(user_input):
         raw_text = leer_especificacion(st.session_state.uploaded_spec)
         ctx = build_context_from_spec(st.session_state.uploaded_spec, raw_text)
 
-        # (Opcional/útil para ver qué se va a inyectar)
+        # Si quieres literalizar el path del listener (en vez de ${general.path}), activa:
+        # ctx["general_path_literal"] = True
+        # ctx["http_port"] = "8081"  # si quieres fijarlo
+
         pretty_ctx_yaml = yaml.safe_dump(ctx, sort_keys=False, allow_unicode=True)
         st.session_state.messages.append({
             "role": "assistant",
@@ -491,7 +630,6 @@ def manejar_mensaje(user_input):
 
         st.session_state.messages.append({"role": "assistant", "content": "⚙️ Generando proyecto desde el arquetipo (sin imágenes/guías)..."})
 
-        # Si subiste RAML, lo inyectamos como archivo; si es DOCX, no hay RAML que inyectar
         raml_bytes = None
         if st.session_state.uploaded_spec.name.lower().endswith(".raml"):
             st.session_state.uploaded_spec.seek(0)
