@@ -154,15 +154,13 @@ def jinja_env(root: Path) -> Environment:
     return Environment(loader=FileSystemLoader(str(root)), undefined=StrictUndefined, keep_trailing_newline=True, autoescape=False)
 
 def first_raml_target(dst_root: Path) -> Path:
-    # 1) target “oficial” del arquetipo
+    # Preferimos starwars.raml según tu arquetipo
     candidate = dst_root / "src/main/resources/api/starwars.raml"
     if candidate.exists() or candidate.parent.exists():
         return candidate
-    # 2) fallback a api.raml si no existe starwars.raml
     candidate2 = dst_root / "src/main/resources/api/api.raml"
     if candidate2.parent.exists():
         return candidate2
-    # 3) último recurso: primer .raml que encontremos
     existing = list(dst_root.rglob("*.raml"))
     return existing[0] if existing else (dst_root / "src/main/resources/api/api.raml")
 
@@ -303,12 +301,21 @@ def build_context_from_spec(spec_file, raw_text: str) -> dict:
         )
         return ctx
 
-# ===================== PARCHES XML/JSON/YAML DIRIGIDOS =====================
+# ===================== HELPERS DE REEMPLAZO SEGURO =====================
 
-def _regex_replace_once(text: str, tag: str, new_value: str) -> str:
-    # Reemplaza PRIMERA ocurrencia <tag>...</tag> por <tag>new_value</tag>
-    pattern = re.compile(rf"(<{tag}\s*>)(.*?)(</{tag}\s*>)", re.DOTALL)
-    return pattern.sub(rf"\1{new_value}\3", text, count=1)
+def replace_grouped(pattern: str, text: str, new_value: str, count: int = 1) -> str:
+    """
+    Reemplaza (inicio)(contenido)(fin) -> inserta new_value en el grupo central.
+    Evita backrefs tipo '\11' cuando new_value inicia con dígito.
+    """
+    rx = re.compile(pattern, re.DOTALL)
+    return rx.sub(lambda m: f"{m.group(1)}{new_value}{m.group(3)}", text, count=count)
+
+def _regex_replace_once(xml_text: str, tag: str, new_value: str) -> str:
+    pattern = rf"(<{tag}\s*>)(.*?)(</{tag}\s*>)"
+    return replace_grouped(pattern, xml_text, new_value, count=1)
+
+# ===================== PARCHES XML/JSON/YAML DIRIGIDOS =====================
 
 def patch_pom_xml_preserving_format(xml_text: str, ctx: Dict) -> str:
     # Campos raíz
@@ -339,67 +346,93 @@ def patch_pom_xml_preserving_format(xml_text: str, ctx: Dict) -> str:
         _set(tag, key)
     # orgId en repos
     if ctx.get("orgId"):
-        xml_text = re.sub(r"(organizations/)[^/]+(/maven)", rf"\1${{orgId}}\2", xml_text, count=1)
+        xml_text = re.sub(r"(organizations/)[^/]+(/maven)", lambda m: f"{m.group(1)}${{orgId}}{m.group(2)}", xml_text, count=1)
         if "<orgId>" not in xml_text and "</properties>" in xml_text:
             xml_text = xml_text.replace("</properties>", f"  <orgId>{ctx['orgId']}</orgId>\n</properties>")
     return xml_text
-# pom.xml (comentarios y posiciones según tu archivo).  ← basado en lo que compartiste
 
 def patch_log4j2_xml(xml_text: str, ctx: Dict) -> str:
-    """
-    Renombra el archivo de log al artifact_id o project_name.
-    Ejemplo original: mx-ms-bc-mulesoft-template.log  →  {artifact_id}.log
-    """
     log_name = ctx.get("artifact_id") or ctx.get("project_name") or "application"
     # fileName
     xml_text = re.sub(
         r'(fileName="\$\{sys:mule\.home\}\$\{sys:file\.separator\}logs\$\{sys:file\.separator\})[^"]+(\.log")',
-        rf'\1{log_name}\2',
+        lambda m: f'{m.group(1)}{log_name}{m.group(2)}',
         xml_text, count=1
     )
     # filePattern
     xml_text = re.sub(
         r'(filePattern="\$\{sys:mule\.home\}\$\{sys:file\.separator\}logs\$\{sys:file\.separator\})[^"]+(-%i\.log")',
-        rf'\1{log_name}\2',
+        lambda m: f'{m.group(1)}{log_name}{m.group(2)}',
         xml_text, count=1
     )
     return xml_text
-# log4j2.xml (ajusta fileName/filePattern).  :contentReference[oaicite:3]{index=3}
 
 def patch_global_config_xml(xml_text: str, ctx: Dict) -> str:
     if ctx.get("http_port"):
-        xml_text = re.sub(r'(http:listener-connection[^>]*port=")[^"]+(")', rf'\g<1>{ctx["http_port"]}\2', xml_text)
+        xml_text = re.sub(
+            r'(http:listener-connection[^>]*port=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["http_port"]}{m.group(2)}', xml_text
+        )
     if ctx.get("starwars_host"):
-        xml_text = re.sub(r'(http:request-connection[^>]*host=")[^"]+(")', rf'\g<1>{ctx["starwars_host"]}\2', xml_text, count=1)
+        xml_text = re.sub(
+            r'(http:request-connection[^>]*host=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["starwars_host"]}{m.group(2)}', xml_text, count=1
+        )
     if ctx.get("starwars_protocol"):
-        xml_text = re.sub(r'(http:request-connection[^>]*protocol=")[^"]+(")', rf'\g<1>{ctx["starwars_protocol"]}\2', xml_text, count=1)
+        xml_text = re.sub(
+            r'(http:request-connection[^>]*protocol=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["starwars_protocol"]}{m.group(2)}', xml_text, count=1
+        )
     if ctx.get("identity_basePath"):
-        xml_text = re.sub(r'(http:request-config[^>]*basePath=")[^"]+(")', rf'\g<1>{ctx["identity_basePath"]}\2', xml_text, count=1)
+        xml_text = re.sub(
+            r'(http:request-config[^>]*basePath=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["identity_basePath"]}{m.group(2)}', xml_text, count=1
+        )
     return xml_text
 
 def patch_main_flow_xml(xml_text: str, ctx: Dict) -> str:
-    # No forzamos api="api\api.raml". Este arquetipo usa api\starwars.raml.
-    # Solo si quieres literalizar el path del listener, activa ctx["general_path_literal"]=True
+    # No tocamos api="api\starwars.raml" (arquetipo ya apunta a starwars.raml)
     if ctx.get("general_path_literal"):
-        xml_text = re.sub(r'(http:listener[^>]*path=")[^"]+(")', rf'\g<1>{ctx["general_path"]}\2', xml_text, count=1)
+        xml_text = re.sub(
+            r'(http:listener[^>]*path=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["general_path"]}{m.group(2)}', xml_text, count=1
+        )
     return xml_text
 
 def patch_client_xml(xml_text: str, ctx: Dict) -> str:
     if ctx.get("starwars_path"):
-        xml_text = re.sub(r'(http:request[^>]*path=")\$\{starwars\.path\}(")', rf'\1{ctx["starwars_path"]}\2', xml_text)
+        xml_text = re.sub(
+            r'(http:request[^>]*path=")\$\{starwars\.path\}(")',
+            lambda m: f'{m.group(1)}{ctx["starwars_path"]}{m.group(2)}', xml_text
+        )
     if ctx.get("starwars_host"):
-        xml_text = re.sub(r'(http:request-connection[^>]*host=")\$\{starwars\.host\}(")', rf'\1{ctx["starwars_host"]}\2', xml_text)
+        xml_text = re.sub(
+            r'(http:request-connection[^>]*host=")\$\{starwars\.host\}(")',
+            lambda m: f'{m.group(1)}{ctx["starwars_host"]}{m.group(2)}', xml_text
+        )
     if ctx.get("starwars_protocol"):
-        xml_text = re.sub(r'(http:request-connection[^>]*protocol=")\$\{starwars\.protocol\}(")', rf'\1{ctx["starwars_protocol"]}\2', xml_text)
+        xml_text = re.sub(
+            r'(http:request-connection[^>]*protocol=")\$\{starwars\.protocol\}(")',
+            lambda m: f'{m.group(1)}{ctx["starwars_protocol"]}{m.group(2)}', xml_text
+        )
     return xml_text
 
 def patch_validate_token_xml(xml_text: str, ctx: Dict) -> str:
     if ctx.get("identity_host"):
-        xml_text = re.sub(r'(http:request-connection[^>]*host=")[^"]+(")', rf'\g<1>{ctx["identity_host"]}\2', xml_text, count=1)
+        xml_text = re.sub(
+            r'(http:request-connection[^>]*host=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["identity_host"]}{m.group(2)}', xml_text, count=1
+        )
     if ctx.get("identity_basePath"):
-        xml_text = re.sub(r'(http:request-config[^>]*basePath=")[^"]+(")', rf'\g<1>{ctx["identity_basePath"]}\2', xml_text, count=1)
+        xml_text = re.sub(
+            r'(http:request-config[^>]*basePath=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["identity_basePath"]}{m.group(2)}', xml_text, count=1
+        )
     if ctx.get("identity_path"):
-        xml_text = re.sub(r'(http:request[^>]*path=")\$\{partyIdentify\.path\}(")', rf'\1{ctx["identity_path"]}\2', xml_text, count=1)
+        xml_text = re.sub(
+            r'(http:request[^>]*path=")\$\{partyIdentify\.path\}(")',
+            lambda m: f'{m.group(1)}{ctx["identity_path"]}{m.group(2)}', xml_text, count=1
+        )
     return xml_text
 
 def patch_exchange_json(json_text: str, ctx: Dict) -> str:
@@ -416,10 +449,6 @@ def patch_exchange_json(json_text: str, ctx: Dict) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 def patch_properties_yaml(yaml_text: str, ctx: Dict) -> str:
-    """
-    Escribe claves comunes en los properties por ambiente (dev/local/qa/prod):
-      app.name, general.path, starwars.host/protocol/path, http.port (si ctx trae http_port)
-    """
     try:
         y = yaml.safe_load(yaml_text) or {}
     except Exception:
@@ -452,19 +481,18 @@ def patch_generic_mule_xml(xml_text: str, filename: str, ctx: Dict) -> str:
     """Router para aplicar parches seguros por archivo."""
     fname = filename.lower()
     if fname == "pom.xml":
-        return patch_pom_xml_preserving_format(xml_text, ctx)                 # pom.xml
+        return patch_pom_xml_preserving_format(xml_text, ctx)
     if "log4j2.xml" in fname:
-        return patch_log4j2_xml(xml_text, ctx)                                # log4j2.xml  :contentReference[oaicite:5]{index=5}
+        return patch_log4j2_xml(xml_text, ctx)
     if "global-config" in fname:
-        return patch_global_config_xml(xml_text, ctx)                         # global-config.xml
+        return patch_global_config_xml(xml_text, ctx)
     if "mainflow" in fname:
-        return patch_main_flow_xml(xml_text, ctx)                             # *-mainFlow.xml
+        return patch_main_flow_xml(xml_text, ctx)
     if "client" in fname:
-        return patch_client_xml(xml_text, ctx)                                # *-client.xml
+        return patch_client_xml(xml_text, ctx)
     if "validate-token" in fname:
-        return patch_validate_token_xml(xml_text, ctx)                        # validate-token.xml
-    if "application-types.xml" in fname:
-        return xml_text  # Autogenerado por Studio; no se toca.  :contentReference[oaicite:6]{index=6}
+        return patch_validate_token_xml(xml_text, ctx)
+    # Otros XML (handler/orchestrator/error/healthcheck) se tocan solo vía tokens clásicos
     return xml_text
 
 # ===================== PIPE DE RENDER/COPIA =====================
@@ -497,7 +525,7 @@ def render_or_copy(src: Path, dst: Path, env: Environment, ctx: Dict, token_repl
 
         # exchange.json (asset de Exchange)
         if src.suffix.lower() == ".json" and src.name.lower() == "exchange.json":
-            content = patch_exchange_json(content, ctx)                        # exchange.json  :contentReference[oaicite:7]{index=7}
+            content = patch_exchange_json(content, ctx)
 
         # properties YAML por ambiente (dev/local/qa/prod)
         if src.suffix.lower() in [".yaml", ".yml"] and src.name.lower().endswith("-properties.yaml"):
@@ -580,7 +608,7 @@ def generate_from_archetype_zip(arquetipo_zip: str, ctx: Dict, raml_bytes: Optio
     skipped = render_tree_from_root(archetype_root, dst_root, ctx, include_guides=include_guides, token_replace=True)
 
     if raml_bytes:
-        tmp_raml = Path(tempfile.mkdtemp()) / "api.raml"
+        tmp_raml = Path(tempfile.mkdtemp()) / "starwars.raml"
         with open(tmp_raml, "wb") as f:
             f.write(raml_bytes)
         inject_raml(dst_root, tmp_raml)
@@ -618,9 +646,9 @@ def manejar_mensaje(user_input):
         raw_text = leer_especificacion(st.session_state.uploaded_spec)
         ctx = build_context_from_spec(st.session_state.uploaded_spec, raw_text)
 
-        # Si quieres literalizar el path del listener (en vez de ${general.path}), activa:
-        # ctx["general_path_literal"] = True
-        # ctx["http_port"] = "8081"  # si quieres fijarlo
+        # Opcionales:
+        # ctx["general_path_literal"] = True   # para escribir el path del listener literal
+        # ctx["http_port"] = "8081"            # fija puerto si quieres
 
         pretty_ctx_yaml = yaml.safe_dump(ctx, sort_keys=False, allow_unicode=True)
         st.session_state.messages.append({
