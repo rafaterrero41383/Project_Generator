@@ -102,6 +102,7 @@ project_name: nombre amigable del proyecto (string)
 artifact_id: id maven en kebab-case (string)
 version: semver (string, ej: 1.0.0)
 group_id: maven groupId (string, por defecto com.company.experience)
+tipo_api: Experience | System | Process (elige una si hay indicios, si no deja null)
 base_uri: URI base del API (string o null)
 host_name: host si se puede inferir (string o null)
 protocol: HTTP/HTTPS si se infiere (string o null)
@@ -116,8 +117,8 @@ endpoints: lista de endpoints "raíz" del RAML (array de strings)
 
 Reglas:
 - artifact_id = project_name en kebab-case.
-- general_path: si hay base_path o primer endpoint, usarlo en forma "/<path>/*". Si base_path termina con segmento “/evaluate”, usar "/<base_path>/*".
-- Si base_uri tiene variables {HOST} o similares, host_name = null pero sí deriva protocol y base_path.
+- general_path: si hay base_path o primer endpoint, usar "/<path>/*"; si el último segmento es muy específico (p.ej. "/evaluate"), mantén "/<base>/v1/*" si encaja mejor.
+- Si base_uri tiene variables {HOST} o similares, host_name = null pero deriva protocol y base_path.
 - No incluyas texto fuera del YAML.
 """
 
@@ -137,7 +138,6 @@ def inferir_metadatos(contenido_api: str) -> dict:
     try:
         data = yaml.safe_load(yml) or {}
     except Exception:
-        # fallback minimal
         data = {}
 
     # defaults mínimos
@@ -148,13 +148,43 @@ def inferir_metadatos(contenido_api: str) -> dict:
     data.setdefault("version","1.0.0")
     data.setdefault("group_id","com.company.experience")
     data.setdefault("general_path","/api/*")
-    # herencia starwars_* por compatibilidad de arquetipo
+    # herencia starwars_* por compatibilidad
     data.setdefault("starwars_host", data.get("host_name"))
     data.setdefault("starwars_protocol", data.get("protocol"))
     if not data.get("starwars_path"):
         base_path = (data.get("base_path") or "").lstrip("/")
         data["starwars_path"] = ("/"+base_path) if base_path else "/"
+
+    # Enriquecimiento por capa (perfil)
+    data = aplicar_perfil_por_capa(data)
     return data
+
+# ========= Perfil por capa =========
+
+def aplicar_perfil_por_capa(ctx: dict) -> dict:
+    capa = (ctx.get("tipo_api") or "").strip().lower()
+    # Prefijos y defaults por capa
+    pref_map = {"experience": "exp", "system": "sys", "process": "prc"}
+    # Si hay capa, exponemos un prefijo para flows y opcionalmente artifact
+    if capa in pref_map:
+        ctx.setdefault("layer_prefix", pref_map[capa])
+        # Ajuste groupId por convención (conservador, sólo si viene default genérico)
+        if ctx.get("group_id","").startswith("com.company"):
+            ctx["group_id"] = f"com.company.{pref_map[capa]}"
+        # Ajuste general_path si quedó muy genérico
+        if ctx.get("general_path") in (None, "", "/api/*"):
+            # intenta construir desde base_path
+            bp = (ctx.get("base_path") or "").strip("/")
+            if bp:
+                # recorta última hoja muy específica
+                parts = bp.split("/")
+                if len(parts) >= 2:
+                    ctx["general_path"] = "/" + "/".join(parts[:2]) + "/*"
+                else:
+                    ctx["general_path"] = "/" + bp + "/*"
+            else:
+                ctx["general_path"] = f"/{pref_map[capa]}/*"
+    return ctx
 
 # ========= Parte 2: Reescritura de archivos con ChatGPT =========
 
@@ -164,7 +194,7 @@ Objetivo: actualizar el archivo indicado usando los METADATOS (YAML) provistos.
 Instrucciones estrictas:
 - Mantén el MISMO formato y los mismos saltos de línea.
 - No agregues explicaciones, comentarios extra ni bloques ```.
-- Si el archivo contiene comentarios del tipo "==== ..." que indican qué poner, síguelos.
+- Sigue los comentarios guía (por ejemplo los marcados con "====") y sustituye valores acordes.
 - Sustituye placeholders o literales relevantes (groupId, artifactId, version, name, project.mule.name, http listener path/port, http request host/protocol/path, exchange.json main/assetId/groupId/name/version, propiedades YAML app/general/starwars).
 - Si un valor del contexto es null, NO lo inventes; deja el original.
 - No elimines secciones no relacionadas.
@@ -178,7 +208,6 @@ Responde **solo** con el contenido final del archivo, sin texto extra.
 {original}
 """
 
-# Sanear salidas del LLM (quitar fences y quedarse con el último bloque si vino repetido)
 def limpiar_contenido_llm(raw: str) -> str:
     blocks = re.findall(r"```(?:xml|yaml|yml|json|properties|txt)?\s*(.*?)```", raw, re.DOTALL)
     if blocks:
@@ -192,10 +221,90 @@ def transformar_archivo_con_gpt(fname: str, original: str, ctx: dict) -> str:
         {"role":"user","content": PROMPT_FILE.format(ctx_yaml=ctx_yaml, fname=fname, original=original)}
     ], temperature=0.1)
     contenido = limpiar_contenido_llm(raw)
-    # Fallback: si el modelo devolvió vacío o solo repitió poco, no arriesgamos
     if not contenido or len(contenido.splitlines()) < max(3, int(len(original.splitlines())*0.3)):
         return original
     return contenido
+
+# ========= Parte 2.5: Postprocesos deterministas (flows + TLS) =========
+
+def _safe_sub(rx, text, repl_fn, count=0):
+    r = re.compile(rx, re.DOTALL)
+    return r.sub(lambda m: repl_fn(m), text, count=count)
+
+def _already_prefixed(name: str, prefix: str) -> bool:
+    p = prefix.lower()
+    return name.lower().startswith(p + "-") or name.lower().startswith(p + ":")
+
+def renombrar_flows(xml_text: str, ctx: dict) -> str:
+    """Prefija nombre de flow/sub-flow con artifact_id o layer_prefix-artifact."""
+    artifact = ctx.get("artifact_id", "app")
+    layer = ctx.get("layer_prefix")
+    prefix = f"{layer}-{artifact}" if layer else artifact
+
+    def repl(m):
+        start, old, end = m.group(1), m.group(2), m.group(3)
+        if _already_prefixed(old, prefix) or _already_prefixed(old, artifact):
+            return f'{start}{old}{end}'
+        new = f"{prefix}-{old}"
+        # normaliza dobles guiones
+        new = re.sub(r"--+", "-", new)
+        return f'{start}{new}{end}'
+
+    # flow y sub-flow
+    xml_text = _safe_sub(r'(<flow\s+name=")([^"]+)(")', xml_text, repl)
+    xml_text = _safe_sub(r'(<sub-flow\s+name=")([^"]+)(")', xml_text, repl)
+    return xml_text
+
+def insertar_o_actualizar_tls(xml_text: str, ctx: dict) -> str:
+    """Inserta <tls:context name="default-tls"> si tls_enabled y xmlns:tls presente; cablea tlsContext-ref."""
+    if not ctx.get("tls_enabled"):
+        return xml_text
+    # Requiere namespace tls en el archivo
+    if "xmlns:tls=" not in xml_text:
+        # si no tiene el ns tls, no forzamos namespaces para no romper validaciones
+        return xml_text
+
+    # 1) Inserta/actualiza contexto TLS por defecto (truststore/keystore si se pasan)
+    has_ctx = "<tls:context" in xml_text
+    tls_ctx = ['<tls:context name="default-tls">']
+    if ctx.get("tls_truststore_path"):
+        tls_ctx.append(f'  <tls:trust-store path="{ctx["tls_truststore_path"]}" password="{ctx.get("tls_truststore_password","")}" type="{ctx.get("tls_truststore_type","JKS")}" />')
+    if ctx.get("tls_keystore_path"):
+        tls_ctx.append(f'  <tls:key-store path="{ctx["tls_keystore_path"]}" password="{ctx.get("tls_keystore_password","")}" type="{ctx.get("tls_keystore_type","JKS")}" />')
+    tls_ctx.append('</tls:context>')
+    tls_block = "\n".join(tls_ctx)
+
+    if not has_ctx:
+        # inserta antes de </mule> si existe
+        if "</mule>" in xml_text:
+            xml_text = xml_text.replace("</mule>", tls_block + "\n</mule>")
+        else:
+            xml_text = xml_text + "\n" + tls_block
+
+    # 2) Cablear tlsContext-ref en conexiones HTTP cuando corresponda
+    def add_tls_ref(conn_rx: str):
+        def repl(m):
+            tag = m.group(0)
+            if 'tlsContext-ref=' in tag:
+                return tag
+            return tag[:-1] + ' tlsContext-ref="default-tls"'
+        return repl
+
+    # Solo si protocolo es HTTPS o el archivo ya usa HTTPS explícito
+    if (ctx.get("starwars_protocol") or "").upper() == "HTTPS" or 'protocol="HTTPS"' in xml_text:
+        xml_text = _safe_sub(r'(<http:request-connection\b[^>]*)(/?>)', xml_text, add_tls_ref(r""), count=0)
+        xml_text = _safe_sub(r'(<http:listener-connection\b[^>]*)(/?>)', xml_text, add_tls_ref(r""), count=0)
+
+    return xml_text
+
+def postprocesar_xml(xml_text: str, fname: str, ctx: dict) -> str:
+    name = fname.lower()
+    # 1) Renombrado de flows/sub-flows
+    if name.endswith(".xml"):
+        xml_text = renombrar_flows(xml_text, ctx)
+    # 2) TLS (global-config, mainFlow, etc.)
+    xml_text = insertar_o_actualizar_tls(xml_text, ctx)
+    return xml_text
 
 # ========= Parte 3: Proceso del arquetipo =========
 
@@ -240,12 +349,15 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                 original = path.read_text(encoding="utf-8", errors="ignore")
                 nuevo = transformar_archivo_con_gpt(path.name, original, ctx)
 
+                # Post-procesos deterministas (flows + TLS)
+                if path.suffix.lower() == ".xml":
+                    nuevo = postprocesar_xml(nuevo, path.name, ctx)
+
                 # Validaciones mínimas por tipo
                 ext = path.suffix.lower()
                 if path.name.lower()=="pom.xml" or ext==".xml":
                     err = validar_xml(nuevo, path.name)
                     if err:
-                        # fallback: deja original
                         errores.append(err + " (revirtiendo)")
                         nuevo = original
                 elif ext in (".yaml",".yml"):
@@ -301,7 +413,7 @@ def manejar_mensaje(user_input: str):
             st.session_state.uploaded_spec.seek(0)
             spec_bytes = st.session_state.uploaded_spec.read()
 
-        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo archivos del arquetipo con ChatGPT..."})
+        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo archivos del arquetipo con ChatGPT + postprocesos (flows/TLS)..."})
         try:
             salida_zip, modificados, errores = procesar_arquetipo_llm(arquetipo, ctx, spec_bytes)
             st.session_state.generated_zip = salida_zip
