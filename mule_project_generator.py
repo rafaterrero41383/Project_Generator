@@ -1,4 +1,3 @@
-import os
 import tempfile
 import zipfile
 import re
@@ -13,11 +12,17 @@ import yaml
 from docx import Document
 import streamlit as st
 from dotenv import load_dotenv
+import os
 from openai import OpenAI
 
 # === CONFIGURACIÓN INICIAL ===
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    st.error("❌ No se encontró la variable OPENAI_API_KEY. Configúrala en los secretos de Streamlit.")
+    st.stop()
+
+client = OpenAI()
 
 st.set_page_config(page_title="🤖 Generador Inteligente de Proyectos Mulesoft", layout="wide")
 
