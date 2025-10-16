@@ -303,17 +303,131 @@ def build_context_from_spec(spec_file, raw_text: str) -> dict:
 
 # ===================== HELPERS DE REEMPLAZO SEGURO =====================
 
+# === helpers de reemplazo seguro (déjalos tal cual) ===
 def replace_grouped(pattern: str, text: str, new_value: str, count: int = 1) -> str:
-    """
-    Reemplaza (inicio)(contenido)(fin) -> inserta new_value en el grupo central.
-    Evita backrefs tipo '\11' cuando new_value inicia con dígito.
-    """
     rx = re.compile(pattern, re.DOTALL)
-    return rx.sub(lambda m: f"{m.group(1)}{new_value}{m.group(3)}", text, count=count)
+    return rx.sub(lambda m: f"{m.group(1)}{new_value}{m.group(2)}", text, count=count)
 
 def _regex_replace_once(xml_text: str, tag: str, new_value: str) -> str:
+    # (<tag>)(contenido)(</tag>)  -> inserta new_value
     pattern = rf"(<{tag}\s*>)(.*?)(</{tag}\s*>)"
-    return replace_grouped(pattern, xml_text, new_value, count=1)
+    rx = re.compile(pattern, re.DOTALL)
+    return rx.sub(lambda m: f"{m.group(1)}{new_value}{m.group(3)}", xml_text, count=1)
+
+# === PARCHES XML “AGRESIVOS” ===
+
+def patch_global_config_xml(xml_text: str, ctx: Dict) -> str:
+    # http:listener-connection/@port
+    if ctx.get("http_port"):
+        xml_text = re.sub(
+            r'(http:listener-connection[^>]*port=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["http_port"]}{m.group(2)}',
+            xml_text
+        )
+    # http:listener/@path (si tenemos general_path lo escribimos)
+    if ctx.get("general_path"):
+        xml_text = re.sub(
+            r'(http:listener\b[^>]*\bpath=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["general_path"]}{m.group(2)}',
+            xml_text
+        )
+    # http:request-connection/@host y @protocol para el “cliente general”
+    if ctx.get("starwars_host"):
+        xml_text = re.sub(
+            r'(http:request-connection\b[^>]*\bhost=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["starwars_host"]}{m.group(2)}',
+            xml_text
+        )
+    if ctx.get("starwars_protocol"):
+        xml_text = re.sub(
+            r'(http:request-connection\b[^>]*\bprotocol=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["starwars_protocol"]}{m.group(2)}',
+            xml_text
+        )
+    # basePath genérico para request-config (si usas identity u otro)
+    if ctx.get("identity_basePath"):
+        xml_text = re.sub(
+            r'(http:request-config\b[^>]*\bbasePath=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["identity_basePath"]}{m.group(2)}',
+            xml_text
+        )
+    return xml_text
+
+
+def patch_main_flow_xml(xml_text: str, ctx: Dict) -> str:
+    # NO tocamos api="api\starwars.raml" (ya apunta bien). Solo path del listener si lo tenemos.
+    if ctx.get("general_path"):
+        xml_text = re.sub(
+            r'(http:listener\b[^>]*\bpath=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["general_path"]}{m.group(2)}',
+            xml_text
+        )
+    return xml_text
+
+
+def patch_client_xml(xml_text: str, ctx: Dict) -> str:
+    # Cambia SIEMPRE el path/host/protocol del http:request y su connection, exista o no placeholder
+    if ctx.get("starwars_path"):
+        xml_text = re.sub(
+            r'(http:request\b[^>]*\bpath=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["starwars_path"]}{m.group(2)}',
+            xml_text
+        )
+    if ctx.get("starwars_host"):
+        xml_text = re.sub(
+            r'(http:request-connection\b[^>]*\bhost=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["starwars_host"]}{m.group(2)}',
+            xml_text
+        )
+    if ctx.get("starwars_protocol"):
+        xml_text = re.sub(
+            r'(http:request-connection\b[^>]*\bprotocol=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["starwars_protocol"]}{m.group(2)}',
+            xml_text
+        )
+    return xml_text
+
+# === router de parches: amplío coincidencias para que SÍ entren ===
+def patch_generic_mule_xml(xml_text: str, filename: str, ctx: Dict) -> str:
+    fname = filename.lower()
+    if fname == "pom.xml":
+        return patch_pom_xml_preserving_format(xml_text, ctx)
+    if "log4j2.xml" in fname:
+        return patch_log4j2_xml(xml_text, ctx)
+    if "global-config" in fname:
+        return patch_global_config_xml(xml_text, ctx)
+    # cualquier mainFlow
+    if "mainflow" in fname:
+        return patch_main_flow_xml(xml_text, ctx)
+    # cualquier client
+    if "client" in fname:
+        return patch_client_xml(xml_text, ctx)
+    # validate-token
+    if "validate-token" in fname or "validatetoken" in fname:
+        return patch_validate_token_xml(xml_text, ctx)
+    return xml_text
+
+def patch_validate_token_xml(xml_text: str, ctx: Dict) -> str:
+    # idem para el endpoint de validación (si lo defines en ctx)
+    if ctx.get("identity_host"):
+        xml_text = re.sub(
+            r'(http:request-connection\b[^>]*\bhost=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["identity_host"]}{m.group(2)}',
+            xml_text
+        )
+    if ctx.get("identity_basePath"):
+        xml_text = re.sub(
+            r'(http:request-config\b[^>]*\bbasePath=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["identity_basePath"]}{m.group(2)}',
+            xml_text
+        )
+    if ctx.get("identity_path"):
+        xml_text = re.sub(
+            r'(http:request\b[^>]*\bpath=")[^"]+(")',
+            lambda m: f'{m.group(1)}{ctx["identity_path"]}{m.group(2)}',
+            xml_text
+        )
+    return xml_text
 
 # ===================== PARCHES XML/JSON/YAML DIRIGIDOS =====================
 
