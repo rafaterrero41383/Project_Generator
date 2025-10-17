@@ -4,11 +4,11 @@ import yaml
 from pathlib import Path
 from urllib.parse import urlparse
 
-# --- Parche compatibilidad 3.13 (tuyo) ---
+# --- Parche compatibilidad 3.13 ---
 if 'imghdr' not in sys.modules:
     imghdr = types.ModuleType("imghdr")
     sys.modules['imghdr'] = imghdr
-# -----------------------------------------
+# ----------------------------------
 
 from docx import Document
 import streamlit as st
@@ -108,9 +108,9 @@ host_name: host si se puede inferir (string o null)
 protocol: HTTP/HTTPS si se infiere (string o null)
 base_path: path sin host, sin query, sin protocolo; sin barra inicial (string o null)
 general_path: path del listener para ${general.path} (string, ej: "/api/*")
-starwars_host: idem host para configuración HTTP (string o null)
-starwars_protocol: HTTP/HTTPS (string o null)
-starwars_path: path que usarán los http:request (string, ej: "/v1/renapo/evaluate")
+upstream_host: host del sistema objetivo (string o null)
+upstream_protocol: HTTP/HTTPS (string o null)
+upstream_path: path base para http:request (string, ej: "/v1/renapo/evaluate")
 media_type: mediaType del RAML si existe (string o null)
 protocols: protocolos del RAML (string o null, separados por coma o null)
 endpoints: lista de endpoints "raíz" del RAML (array de strings)
@@ -148,11 +148,12 @@ def inferir_metadatos(contenido_api: str) -> dict:
     data.setdefault("version","1.0.0")
     data.setdefault("group_id","com.company.experience")
     data.setdefault("general_path","/api/*")
-    data.setdefault("starwars_host", data.get("host_name"))
-    data.setdefault("starwars_protocol", data.get("protocol"))
-    if not data.get("starwars_path"):
+    # herencia upstream_* desde campos RAML
+    data.setdefault("upstream_host", data.get("host_name"))
+    data.setdefault("upstream_protocol", data.get("protocol"))
+    if not data.get("upstream_path"):
         base_path = (data.get("base_path") or "").lstrip("/")
-        data["starwars_path"] = ("/"+base_path) if base_path else "/"
+        data["upstream_path"] = ("/"+base_path) if base_path else "/"
 
     data = aplicar_perfil_por_capa(data)
     return data
@@ -184,7 +185,7 @@ Instrucciones estrictas:
 - Mantén el MISMO formato y los mismos saltos de línea.
 - No agregues explicaciones, comentarios extra ni bloques ```.
 - Sigue los comentarios guía (por ejemplo los marcados con "====") y sustituye valores acordes.
-- Sustituye placeholders o literales relevantes (groupId, artifactId, version, name, project.mule.name, http listener path/port, http request host/protocol/path, exchange.json main/assetId/groupId/name/version, propiedades YAML app/general/starwars).
+- Sustituye placeholders o literales relevantes (groupId, artifactId, version, name, project.mule.name, http listener path/port, http request host/protocol/path, exchange.json main/assetId/groupId/name/version, propiedades YAML app/general/upstream).
 - Si un valor del contexto es null, NO lo inventes; deja el original.
 - No elimines secciones no relacionadas.
 
@@ -270,7 +271,8 @@ def insertar_o_actualizar_tls(xml_text: str, ctx: dict) -> str:
             return tag[:-1] + ' tlsContext-ref="default-tls"'
         return repl
 
-    if (ctx.get("starwars_protocol") or "").upper() == "HTTPS" or 'protocol="HTTPS"' in xml_text:
+    # condición con upstream_protocol
+    if (ctx.get("upstream_protocol") or "").upper() == "HTTPS" or 'protocol="HTTPS"' in xml_text:
         xml_text = _safe_sub(r'(<http:request-connection\b[^>]*)(/?>)', xml_text, add_tls_ref(r""), count=0)
         xml_text = _safe_sub(r'(<http:listener-connection\b[^>]*)(/?>)', xml_text, add_tls_ref(r""), count=0)
 
@@ -328,6 +330,16 @@ def rename_if_needed(path: Path, expected_name: str):
 
 # ========= Helpers RAML → classpath =========
 
+def first_raml_target(dst_root: Path) -> Path:
+    """
+    Preferimos api.raml; si no existe, tomamos el primer *.raml encontrado.
+    """
+    preferred = dst_root / "src/main/resources/api/api.raml"
+    if preferred.parent.exists():
+        return preferred
+    existing = list(dst_root.rglob("*.raml"))
+    return existing[0] if existing else preferred
+
 def raml_classpath(root: Path) -> str|None:
     """Devuelve classpath relativo del RAML (p.ej. 'classpath:/api/api.raml') si existe."""
     target = first_raml_target(root)
@@ -335,7 +347,6 @@ def raml_classpath(root: Path) -> str|None:
         rel = target.relative_to(root / "src/main/resources")
         return "classpath:/" + "/".join(rel.parts)
     except Exception:
-        # fallback si el RAML quedó en otro lugar
         candidates = list(root.rglob("*.raml"))
         if candidates:
             try:
@@ -649,14 +660,6 @@ def write_min_readme(root: Path, resources: dict):
 
 TEXT_EXTS = {".xml",".json",".yaml",".yml",".raml",".properties",".txt",".pom",".md"}
 
-def first_raml_target(dst_root: Path) -> Path:
-    c = dst_root / "src/main/resources/api/starwars.raml"
-    if c.exists() or c.parent.exists(): return c
-    c2 = dst_root / "src/main/resources/api/api.raml"
-    if c2.parent.exists(): return c2
-    existing = list(dst_root.rglob("*.raml"))
-    return existing[0] if existing else (dst_root / "src/main/resources/api/api.raml")
-
 def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None):
     tmp_dir = Path(tempfile.mkdtemp())
     out_zip = Path(tempfile.gettempdir()) / "proyecto_mulesoft_generado.zip"
@@ -711,7 +714,7 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     resources_for_readme = {}
     raml_cp_value = None
     if spec_bytes and st.session_state.uploaded_spec.name.lower().endswith(".raml"):
-        target = first_raml_target(root)
+        target = first_raml_target(root)  # prefer api.raml
         target.parent.mkdir(parents=True, exist_ok=True)
         with open(target, "wb") as f:
             f.write(spec_bytes)
