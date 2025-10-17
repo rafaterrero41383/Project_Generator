@@ -132,6 +132,7 @@ def inferir_metadatos(contenido_api: str) -> dict:
         {"role":"user","content": PROMPT_CTX + "\n\n=== ESPECIFICACIÓN ===\n" + contenido_api}
     ], temperature=0.1)
 
+    # Limpieza defensiva
     m = re.search(r"```(?:yaml|yml)?\s*(.*?)```", yml, re.DOTALL)
     if m: yml = m.group(1).strip()
     try:
@@ -139,6 +140,7 @@ def inferir_metadatos(contenido_api: str) -> dict:
     except Exception:
         data = {}
 
+    # defaults mínimos
     data.setdefault("project_name", "MuleApplication")
     if "artifact_id" not in data:
         slug = re.sub(r"[^a-zA-Z0-9]+","-", data["project_name"]).strip("-").lower()
@@ -324,13 +326,48 @@ def rename_if_needed(path: Path, expected_name: str):
     if path.name != expected_name:
         path.rename(path.with_name(expected_name))
 
-# ========= SCAFFOLD: orchestrators, client, handler =========
+# ========= Helpers RAML → classpath =========
+
+def raml_classpath(root: Path) -> str|None:
+    """Devuelve classpath relativo del RAML (p.ej. 'classpath:/api/api.raml') si existe."""
+    target = first_raml_target(root)
+    try:
+        rel = target.relative_to(root / "src/main/resources")
+        return "classpath:/" + "/".join(rel.parts)
+    except Exception:
+        # fallback si el RAML quedó en otro lugar
+        candidates = list(root.rglob("*.raml"))
+        if candidates:
+            try:
+                rel = candidates[0].relative_to(root / "src/main/resources")
+                return "classpath:/" + "/".join(rel.parts)
+            except Exception:
+                return None
+    return None
+
+# ========= SCAFFOLD: orchestrators, client, handler (con APIkit) =========
 
 def _flow_name(resource: str, suffix: str) -> str:
     return f"{resource}-{suffix}"
 
-def _xml_header():
-    return """<?xml version="1.0" encoding="UTF-8"?>
+def _xml_header(apikit: bool=False):
+    if apikit:
+        return """<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/apikit"
+      xmlns:tls="http://www.mulesoft.org/schema/mule/tls"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/apikit http://www.mulesoft.org/schema/mule/apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/tls http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+""".strip()
+    else:
+        return """<?xml version="1.0" encoding="UTF-8"?>
 <mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
       xmlns:http="http://www.mulesoft.org/schema/mule/http"
       xmlns:tls="http://www.mulesoft.org/schema/mule/tls"
@@ -348,7 +385,7 @@ def _xml_footer():
 
 def _orchestrator_xml_skeleton(resource: str, action: str) -> str:
     flow_name = _flow_name(resource, f"{action}-orchestrator-main")
-    return f"""{_xml_header()}
+    return f"""{_xml_header(False)}
   <!-- Auto-generado: orchestrator base -->
   <flow name="{flow_name}">
     <logger level="INFO" message="[{resource}:{action}] start orchestration"/>
@@ -357,11 +394,35 @@ def _orchestrator_xml_skeleton(resource: str, action: str) -> str:
   </flow>
 {_xml_footer()}""".strip()
 
-def _client_xml_skeleton(resource_pascal: str, general_path: str) -> str:
-    # Listener mínimo; ruta de ejemplo usando general_path.
+def _client_xml_skeleton(resource_pascal: str, general_path: str, raml_cp: str|None) -> str:
+    """
+    Si raml_cp está presente, genera client con APIkit (listener + router).
+    Si no, genera un client mínimo con logger.
+    """
     flow = f"api{resource_pascal}-client-main"
     path = general_path if general_path else "/api/*"
-    return f"""{_xml_header()}
+    if raml_cp:
+        return f"""{_xml_header(True)}
+  <!-- Auto-generado: client con APIkit -->
+  <http:listener-config name="api-httpListener">
+    <http:listener-connection host="0.0.0.0" port="${{http.port}}"/>
+  </http:listener-config>
+
+  <apikit:config name="api-config" raml="{raml_cp}"/>
+
+  <flow name="{flow}">
+    <http:listener config-ref="api-httpListener" path="${{general.path}}" />
+    <apikit:router config-ref="api-config" />
+  </flow>
+
+  <!-- Consola (opcional) -->
+  <flow name="api-console">
+    <http:listener config-ref="api-httpListener" path="/console/*" />
+    <apikit:console config-ref="api-config" />
+  </flow>
+{_xml_footer()}""".strip()
+    else:
+        return f"""{_xml_header(False)}
   <!-- Auto-generado: client base -->
   <flow name="{flow}">
     <logger level="INFO" message="[client] request recibido en {path}"/>
@@ -370,7 +431,7 @@ def _client_xml_skeleton(resource_pascal: str, general_path: str) -> str:
 
 def _handler_xml_skeleton(resource_pascal: str) -> str:
     flow = f"api{resource_pascal}-handler-main"
-    return f"""{_xml_header()}
+    return f"""{_xml_header(False)}
   <!-- Auto-generado: handler base -->
   <flow name="{flow}">
     <logger level="INFO" message="[handler] inicio manejo"/>
@@ -380,7 +441,7 @@ def _handler_xml_skeleton(resource_pascal: str) -> str:
 {_xml_footer()}""".strip()
 
 def _common_error_handler_xml() -> str:
-    return f"""{_xml_header()}
+    return f"""{_xml_header(False)}
   <!-- Auto-generado: common error handler -->
   <sub-flow name="common-error-handler">
     <logger level="ERROR" message="Error en flujo: #[error.description] - #[error.cause]"/>
@@ -406,9 +467,10 @@ def scaffold_orchestrators(root: Path, resources: dict) -> list[str]:
                 created.append(str(path.relative_to(root)))
     return created
 
-def scaffold_client_handler(root: Path, resources: dict, general_path: str) -> list[str]:
+def scaffold_client_handler(root: Path, resources: dict, general_path: str, raml_cp: str|None) -> list[str]:
     """
     Crea client/handler y common-error-handler si faltan.
+    Si hay RAML → client incluye APIkit (listener + router + console).
     """
     created = []
     base = root / "src/main/mule"
@@ -434,7 +496,7 @@ def scaffold_client_handler(root: Path, resources: dict, general_path: str) -> l
         c_name = f"api{pascal}-client.xml"
         c_path = client_dir / c_name
         if not c_path.exists():
-            xml = _client_xml_skeleton(pascal, general_path)
+            xml = _client_xml_skeleton(pascal, general_path, raml_cp)
             try:
                 ET.fromstring(xml)
             except ET.ParseError:
@@ -647,6 +709,7 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
 
     # Inyectar RAML y parsear recursos
     resources_for_readme = {}
+    raml_cp_value = None
     if spec_bytes and st.session_state.uploaded_spec.name.lower().endswith(".raml"):
         target = first_raml_target(root)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -657,10 +720,12 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
             resources_for_readme = parse_resources_from_raml(spec_bytes.decode("utf-8","ignore"))
         except Exception:
             resources_for_readme = {}
+        # classpath del RAML para apikit
+        raml_cp_value = raml_classpath(root)
 
-    # === SCAFFOLD client/handler + common-error-handler (antes de rúbricas) ===
+    # === SCAFFOLD client/handler (+APIkit si hay RAML) y common-error-handler ===
     if resources_for_readme:
-        created_ch = scaffold_client_handler(root, resources_for_readme, ctx.get("general_path"))
+        created_ch = scaffold_client_handler(root, resources_for_readme, ctx.get("general_path"), raml_cp_value)
         if created_ch:
             modificados.extend(created_ch)
 
@@ -718,7 +783,7 @@ def manejar_mensaje(user_input: str):
             st.session_state.uploaded_spec.seek(0)
             spec_bytes = st.session_state.uploaded_spec.read()
 
-        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo archivos del arquetipo con ChatGPT + scaffolds (client/handler/orchestrators) + rúbricas..."})
+        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo archivos del arquetipo con ChatGPT + scaffolds (client/APIkit/handler/orchestrators) + rúbricas..."})
         try:
             salida_zip, modificados, errores = procesar_arquetipo_llm(arquetipo, ctx, spec_bytes)
             st.session_state.generated_zip = salida_zip
