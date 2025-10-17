@@ -132,7 +132,6 @@ def inferir_metadatos(contenido_api: str) -> dict:
         {"role":"user","content": PROMPT_CTX + "\n\n=== ESPECIFICACIÓN ===\n" + contenido_api}
     ], temperature=0.1)
 
-    # Limpieza defensiva (por si devuelve bloque con ```yaml)
     m = re.search(r"```(?:yaml|yml)?\s*(.*?)```", yml, re.DOTALL)
     if m: yml = m.group(1).strip()
     try:
@@ -140,7 +139,6 @@ def inferir_metadatos(contenido_api: str) -> dict:
     except Exception:
         data = {}
 
-    # defaults mínimos
     data.setdefault("project_name", "MuleApplication")
     if "artifact_id" not in data:
         slug = re.sub(r"[^a-zA-Z0-9]+","-", data["project_name"]).strip("-").lower()
@@ -148,14 +146,12 @@ def inferir_metadatos(contenido_api: str) -> dict:
     data.setdefault("version","1.0.0")
     data.setdefault("group_id","com.company.experience")
     data.setdefault("general_path","/api/*")
-    # herencia starwars_* por compatibilidad
     data.setdefault("starwars_host", data.get("host_name"))
     data.setdefault("starwars_protocol", data.get("protocol"))
     if not data.get("starwars_path"):
         base_path = (data.get("base_path") or "").lstrip("/")
         data["starwars_path"] = ("/"+base_path) if base_path else "/"
 
-    # Enriquecimiento por capa (perfil)
     data = aplicar_perfil_por_capa(data)
     return data
 
@@ -163,25 +159,16 @@ def inferir_metadatos(contenido_api: str) -> dict:
 
 def aplicar_perfil_por_capa(ctx: dict) -> dict:
     capa = (ctx.get("tipo_api") or "").strip().lower()
-    # Prefijos y defaults por capa
     pref_map = {"experience": "exp", "system": "sys", "process": "prc"}
-    # Si hay capa, exponemos un prefijo para flows y opcionalmente artifact
     if capa in pref_map:
         ctx.setdefault("layer_prefix", pref_map[capa])
-        # Ajuste groupId por convención (conservador, sólo si viene default genérico)
         if ctx.get("group_id","").startswith("com.company"):
             ctx["group_id"] = f"com.company.{pref_map[capa]}"
-        # Ajuste general_path si quedó muy genérico
         if ctx.get("general_path") in (None, "", "/api/*"):
-            # intenta construir desde base_path
             bp = (ctx.get("base_path") or "").strip("/")
             if bp:
-                # recorta última hoja muy específica
                 parts = bp.split("/")
-                if len(parts) >= 2:
-                    ctx["general_path"] = "/" + "/".join(parts[:2]) + "/*"
-                else:
-                    ctx["general_path"] = "/" + bp + "/*"
+                ctx["general_path"] = "/" + ("/".join(parts[:2]) if len(parts)>=2 else bp) + "/*"
             else:
                 ctx["general_path"] = f"/{pref_map[capa]}/*"
     return ctx
@@ -236,7 +223,6 @@ def _already_prefixed(name: str, prefix: str) -> bool:
     return name.lower().startswith(p + "-") or name.lower().startswith(p + ":")
 
 def renombrar_flows(xml_text: str, ctx: dict) -> str:
-    """Prefija nombre de flow/sub-flow con artifact_id o layer_prefix-artifact."""
     artifact = ctx.get("artifact_id", "app")
     layer = ctx.get("layer_prefix")
     prefix = f"{layer}-{artifact}" if layer else artifact
@@ -246,43 +232,35 @@ def renombrar_flows(xml_text: str, ctx: dict) -> str:
         if _already_prefixed(old, prefix) or _already_prefixed(old, artifact):
             return f'{start}{old}{end}'
         new = f"{prefix}-{old}"
-        # normaliza dobles guiones
         new = re.sub(r"--+", "-", new)
         return f'{start}{new}{end}'
 
-    # flow y sub-flow
     xml_text = _safe_sub(r'(<flow\s+name=")([^"]+)(")', xml_text, repl)
     xml_text = _safe_sub(r'(<sub-flow\s+name=")([^"]+)(")', xml_text, repl)
     return xml_text
 
 def insertar_o_actualizar_tls(xml_text: str, ctx: dict) -> str:
-    """Inserta <tls:context name="default-tls"> si tls_enabled y xmlns:tls presente; cablea tlsContext-ref."""
     if not ctx.get("tls_enabled"):
         return xml_text
-    # Requiere namespace tls en el archivo
     if "xmlns:tls=" not in xml_text:
-        # si no tiene el ns tls, no forzamos namespaces para no romper validaciones
         return xml_text
 
-    # 1) Inserta/actualiza contexto TLS por defecto (truststore/keystore si se pasan)
     has_ctx = "<tls:context" in xml_text
     tls_ctx = ['<tls:context name="default-tls">']
     if ctx.get("tls_truststore_path"):
-        tls_ctx.append(f'  <tls:trust-store path="{ctx["tls_truststore_path"]}" password="{ctx.get("tls_truststore_password","")}" type="{ctx.get("tls_truststore_type","JKS")}" />')
+        tls_ctx.append(f'  <tls:trust-store path="{ctx["tls_truststore_path"]}" password="{ctx.get("tls_truststore_password","")}"></tls:trust-store>')
     if ctx.get("tls_keystore_path"):
-        tls_ctx.append(f'  <tls:key-store path="{ctx["tls_keystore_path"]}" password="{ctx.get("tls_keystore_password","")}" type="{ctx.get("tls_keystore_type","JKS")}" />')
+        tls_ctx.append(f'  <tls:key-store path="{ctx["tls_keystore_path"]}" password="{ctx.get("tls_keystore_password","")}"></tls:key-store>')
     tls_ctx.append('</tls:context>')
     tls_block = "\n".join(tls_ctx)
 
     if not has_ctx:
-        # inserta antes de </mule> si existe
         if "</mule>" in xml_text:
             xml_text = xml_text.replace("</mule>", tls_block + "\n</mule>")
         else:
             xml_text = xml_text + "\n" + tls_block
 
-    # 2) Cablear tlsContext-ref en conexiones HTTP cuando corresponda
-    def add_tls_ref(conn_rx: str):
+    def add_tls_ref(_rx: str):
         def repl(m):
             tag = m.group(0)
             if 'tlsContext-ref=' in tag:
@@ -290,7 +268,6 @@ def insertar_o_actualizar_tls(xml_text: str, ctx: dict) -> str:
             return tag[:-1] + ' tlsContext-ref="default-tls"'
         return repl
 
-    # Solo si protocolo es HTTPS o el archivo ya usa HTTPS explícito
     if (ctx.get("starwars_protocol") or "").upper() == "HTTPS" or 'protocol="HTTPS"' in xml_text:
         xml_text = _safe_sub(r'(<http:request-connection\b[^>]*)(/?>)', xml_text, add_tls_ref(r""), count=0)
         xml_text = _safe_sub(r'(<http:listener-connection\b[^>]*)(/?>)', xml_text, add_tls_ref(r""), count=0)
@@ -299,12 +276,312 @@ def insertar_o_actualizar_tls(xml_text: str, ctx: dict) -> str:
 
 def postprocesar_xml(xml_text: str, fname: str, ctx: dict) -> str:
     name = fname.lower()
-    # 1) Renombrado de flows/sub-flows
     if name.endswith(".xml"):
         xml_text = renombrar_flows(xml_text, ctx)
-    # 2) TLS (global-config, mainFlow, etc.)
     xml_text = insertar_o_actualizar_tls(xml_text, ctx)
     return xml_text
+
+# ========= RÚBRICAS y utilidades =========
+
+VALID_ACTIONS = {"retrieve","evaluate","execute","init","create","update","delete"}
+
+def ensure_dirs(root: Path):
+    base = root / "src/main/mule"
+    for d in ["client", "handler", "orchestrator", "common"]:
+        (base / d).mkdir(parents=True, exist_ok=True)
+
+def forbid_loose_xml(root: Path) -> list[str]:
+    base = root / "src/main/mule"
+    bad = []
+    for p in base.glob("*.xml"):
+        bad.append(str(p))
+    return bad
+
+def parse_resources_from_raml(raml_text: str) -> dict:
+    res = {}
+    for line in raml_text.splitlines():
+        line = line.strip()
+        if line.startswith("/"):
+            parts = [x for x in line.split("/") if x]
+            if not parts:
+                continue
+            recurso = parts[0]
+            action = parts[-1].lower()
+            name = recurso[0].lower()+recurso[1:] if recurso else "resource"
+            res.setdefault(name, set())
+            if action in VALID_ACTIONS:
+                res[name].add(action)
+    return res
+
+def canonical_names(api_resource: str, actions: set[str]) -> dict:
+    pascal = api_resource[0].upper()+api_resource[1:]
+    client = f"api{pascal}-client.xml"
+    handler = f"api{pascal}-handler.xml"
+    orch = [f"{api_resource}-{a}-orchestrator.xml" for a in (actions or {"retrieve"})]
+    return {"client": client, "handler": handler, "orchestrators": orch}
+
+def rename_if_needed(path: Path, expected_name: str):
+    if path.name != expected_name:
+        path.rename(path.with_name(expected_name))
+
+# ========= SCAFFOLD: orchestrators, client, handler =========
+
+def _flow_name(resource: str, suffix: str) -> str:
+    return f"{resource}-{suffix}"
+
+def _xml_header():
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:tls="http://www.mulesoft.org/schema/mule/tls"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/tls http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+""".strip()
+
+def _xml_footer():
+    return "</mule>\n"
+
+def _orchestrator_xml_skeleton(resource: str, action: str) -> str:
+    flow_name = _flow_name(resource, f"{action}-orchestrator-main")
+    return f"""{_xml_header()}
+  <!-- Auto-generado: orchestrator base -->
+  <flow name="{flow_name}">
+    <logger level="INFO" message="[{resource}:{action}] start orchestration"/>
+    <!-- TODO: invocar subflows/client aquí -->
+    <logger level="INFO" message="[{resource}:{action}] end orchestration"/>
+  </flow>
+{_xml_footer()}""".strip()
+
+def _client_xml_skeleton(resource_pascal: str, general_path: str) -> str:
+    # Listener mínimo; ruta de ejemplo usando general_path.
+    flow = f"api{resource_pascal}-client-main"
+    path = general_path if general_path else "/api/*"
+    return f"""{_xml_header()}
+  <!-- Auto-generado: client base -->
+  <flow name="{flow}">
+    <logger level="INFO" message="[client] request recibido en {path}"/>
+  </flow>
+{_xml_footer()}""".strip()
+
+def _handler_xml_skeleton(resource_pascal: str) -> str:
+    flow = f"api{resource_pascal}-handler-main"
+    return f"""{_xml_header()}
+  <!-- Auto-generado: handler base -->
+  <flow name="{flow}">
+    <logger level="INFO" message="[handler] inicio manejo"/>
+    <!-- TODO: validaciones, mapping, llamadas a orchestrator -->
+    <logger level="INFO" message="[handler] fin manejo"/>
+  </flow>
+{_xml_footer()}""".strip()
+
+def _common_error_handler_xml() -> str:
+    return f"""{_xml_header()}
+  <!-- Auto-generado: common error handler -->
+  <sub-flow name="common-error-handler">
+    <logger level="ERROR" message="Error en flujo: #[error.description] - #[error.cause]"/>
+  </sub-flow>
+{_xml_footer()}""".strip()
+
+def scaffold_orchestrators(root: Path, resources: dict) -> list[str]:
+    created = []
+    base = root / "src/main/mule/orchestrator"
+    base.mkdir(parents=True, exist_ok=True)
+    for resource, actions in (resources or {}).items():
+        planned = sorted(actions or {"retrieve"})
+        for action in planned:
+            fname = f"{resource}-{action}-orchestrator.xml"
+            path = base / fname
+            if not path.exists():
+                xml = _orchestrator_xml_skeleton(resource, action)
+                try:
+                    ET.fromstring(xml)
+                except ET.ParseError:
+                    xml = f"<mule><flow name='{_flow_name(resource, f'{action}-orchestrator-main')}'/></mule>"
+                path.write_text(xml, encoding="utf-8")
+                created.append(str(path.relative_to(root)))
+    return created
+
+def scaffold_client_handler(root: Path, resources: dict, general_path: str) -> list[str]:
+    """
+    Crea client/handler y common-error-handler si faltan.
+    """
+    created = []
+    base = root / "src/main/mule"
+    client_dir = base / "client"
+    handler_dir = base / "handler"
+    client_dir.mkdir(parents=True, exist_ok=True)
+    handler_dir.mkdir(parents=True, exist_ok=True)
+
+    # common-error-handler.xml
+    ceh = handler_dir / "common-error-handler.xml"
+    if not ceh.exists():
+        xml = _common_error_handler_xml()
+        try:
+            ET.fromstring(xml)
+        except ET.ParseError:
+            xml = "<mule><sub-flow name='common-error-handler'/></mule>"
+        ceh.write_text(xml, encoding="utf-8")
+        created.append(str(ceh.relative_to(root)))
+
+    for resource, actions in (resources or {}).items():
+        pascal = resource[0].upper()+resource[1:] if resource else "Resource"
+        # client
+        c_name = f"api{pascal}-client.xml"
+        c_path = client_dir / c_name
+        if not c_path.exists():
+            xml = _client_xml_skeleton(pascal, general_path)
+            try:
+                ET.fromstring(xml)
+            except ET.ParseError:
+                xml = f"<mule><flow name='api{pascal}-client-main'/></mule>"
+            c_path.write_text(xml, encoding="utf-8")
+            created.append(str(c_path.relative_to(root)))
+        # handler
+        h_name = f"api{pascal}-handler.xml"
+        h_path = handler_dir / h_name
+        if not h_path.exists():
+            xml = _handler_xml_skeleton(pascal)
+            try:
+                ET.fromstring(xml)
+            except ET.ParseError:
+                xml = f"<mule><flow name='api{pascal}-handler-main'/></mule>"
+            h_path.write_text(xml, encoding="utf-8")
+            created.append(str(h_path.relative_to(root)))
+    return created
+
+# ========= Rúbricas (aplican después del scaffold) =========
+
+def enforce_rubrics_on_tree(root: Path, raml_bytes: bytes|None) -> list[str]:
+    errors = []
+    ensure_dirs(root)
+
+    base = root / "src/main/mule"
+    client_dir = base / "client"
+    handler_dir = base / "handler"
+    orch_dir = base / "orchestrator"
+    common_dir = base / "common"
+
+    loose = forbid_loose_xml(root)
+    if loose:
+        errors.append(f"XMLs sueltos en src/main/mule: {', '.join(loose)}")
+
+    resources = {}
+    if raml_bytes:
+        try:
+            raml_text = raml_bytes.decode("utf-8","ignore")
+            resources = parse_resources_from_raml(raml_text)
+        except Exception:
+            resources = {}
+    if not resources:
+        mf = list(base.rglob("*-mainFlow.xml"))
+        stem = "api"
+        if mf:
+            stem = mf[0].stem.replace("-mainFlow","")
+        resources = {stem: set()}
+
+    for recurso, actions in resources.items():
+        expected = canonical_names(recurso, actions)
+
+        existing_client = list(client_dir.glob("*.xml"))
+        if not existing_client:
+            errors.append(f"Falta archivo client para recurso {recurso}")
+        else:
+            rename_if_needed(existing_client[0], expected["client"])
+            if not re.match(r"^api[A-Z][A-Za-z0-9]*-client\.xml$", expected["client"]):
+                errors.append(f"Nombre inválido en client: {expected['client']}")
+
+        existing_handler = [p for p in handler_dir.glob("*.xml") if p.name != "common-error-handler.xml"]
+        if not existing_handler:
+            errors.append(f"Falta archivo handler para recurso {recurso}")
+        else:
+            rename_if_needed(existing_handler[0], expected["handler"])
+            if not re.match(r"^api[A-Z][A-Za-z0-9]*-handler\.xml$", expected["handler"]):
+                errors.append(f"Nombre inválido en handler: {expected['handler']}")
+
+        if not (handler_dir / "common-error-handler.xml").exists():
+            errors.append("Falta common-error-handler.xml en handler/")
+
+        existing_orch = list(orch_dir.glob("*.xml"))
+        if not existing_orch:
+            errors.append(f"Faltan orchestrators para recurso {recurso}")
+        else:
+            if not actions:
+                actions = {"retrieve"}
+            expected_orch = set(expected["orchestrators"])
+            for exp, cur in zip(sorted(expected_orch), existing_orch):
+                rename_if_needed(cur, exp)
+            bad = [p.name for p in orch_dir.glob("*.xml")
+                   if not re.match(r"^[a-z][A-Za-z0-9]*-(retrieve|evaluate|execute|init|create|update|delete)-orchestrator\.xml$", p.name)]
+            if bad:
+                errors.append(f"Nombres inválidos en orchestrator: {', '.join(bad)}")
+
+    for p in common_dir.glob("*.xml"):
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            if 'http:listener' in text:
+                errors.append("common/ no debe contener listeners HTTP")
+        except Exception:
+            pass
+
+    return errors
+
+def write_validate_script(root: Path):
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    content = """#!/usr/bin/env bash
+set -euo pipefail
+
+# 1) Carpetas obligatorias
+for d in client handler orchestrator common; do
+  test -d "src/main/mule/$d" || { echo "Falta carpeta $d"; exit 1; }
+done
+
+# 2) Nada de XMLs sueltos en src/main/mule
+if find src/main/mule -maxdepth 1 -type f -name "*.xml" | grep -q .; then
+  echo "No debe haber .xml en src/main/mule (mover a client/handler/orchestrator/common)"
+  exit 1
+fi
+
+# 3) Nombres válidos por capa
+if find src/main/mule/client -type f -name "*.xml" | grep -Pv '^.*/api[A-Z][A-Za-z0-9]*-client\\.xml$' | grep -q .; then
+  echo "Nombre inválido en client (usar api<Recurso>-client.xml)"; exit 1
+fi
+
+if find src/main/mule/handler -type f -name "*.xml" | grep -Pv '^.*/(api[A-Z][A-Za-z0-9]*-handler|common-error-handler)\\.xml$' | grep -q .; then
+  echo "Nombre inválido en handler (usar api<Recurso>-handler.xml o common-error-handler.xml)"; exit 1
+fi
+
+if find src/main/mule/orchestrator -type f -name "*.xml" | grep -Pv '^.*/[a-z][A-Za-z0-9]*-(retrieve|evaluate|execute|init|create|update|delete)-orchestrator\\.xml$' | grep -q .; then
+  echo "Nombre inválido en orchestrator (<recurso>-<action>-orchestrator.xml)"; exit 1
+fi
+
+echo "Validación de estructura OK ✅"
+"""
+    (scripts / "validate-structure.sh").write_text(content, encoding="utf-8")
+    os.chmod(scripts / "validate-structure.sh", 0o755)
+
+def write_min_readme(root: Path, resources: dict):
+    readme = root / "README.md"
+    lines = [
+        "# Proyecto MuleSoft",
+        "",
+        "## Recursos y correlación por capa",
+        "",
+        "| Recurso | Client | Handler | Orchestrators |",
+        "|---|---|---|---|",
+    ]
+    for r, actions in resources.items():
+        pascal = r[0].upper()+r[1:] if r else "Resource"
+        client = f"api{pascal}-client.xml"
+        handler = f"api{pascal}-handler.xml"
+        orchs = ", ".join(sorted([f"{r}-{a}-orchestrator.xml" for a in (actions or {'retrieve'})]))
+        lines.append(f"| {r} | {client} | {handler} | {orchs} |")
+    readme.write_text("\n".join(lines)+"\n", encoding="utf-8")
 
 # ========= Parte 3: Proceso del arquetipo =========
 
@@ -325,7 +602,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     with zipfile.ZipFile(arquetipo_zip, "r") as z:
         z.extractall(tmp_dir)
 
-    # carpeta raíz del arquetipo (si venía anidada)
     roots = [p for p in tmp_dir.iterdir() if p.is_dir()]
     root = roots[0] if len(roots)==1 else tmp_dir
 
@@ -334,7 +610,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     for r,_,fs in os.walk(root):
         for f in fs:
             p = Path(r)/f
-            # excluye imágenes/guias
             if p.suffix.lower() in (".png",".jpg",".jpeg",".gif",".webp",".svg",".pdf",".ppt",".pptx",".key",".ai",".psd"):
                 continue
             files_to_touch.append(p)
@@ -349,11 +624,9 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                 original = path.read_text(encoding="utf-8", errors="ignore")
                 nuevo = transformar_archivo_con_gpt(path.name, original, ctx)
 
-                # Post-procesos deterministas (flows + TLS)
                 if path.suffix.lower() == ".xml":
                     nuevo = postprocesar_xml(nuevo, path.name, ctx)
 
-                # Validaciones mínimas por tipo
                 ext = path.suffix.lower()
                 if path.name.lower()=="pom.xml" or ext==".xml":
                     err = validar_xml(nuevo, path.name)
@@ -372,15 +645,47 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
         except Exception as e:
             errores.append(f"⚠️ Error en {path.name}: {e}")
 
-    # Inyectar RAML del usuario si lo subió
+    # Inyectar RAML y parsear recursos
+    resources_for_readme = {}
     if spec_bytes and st.session_state.uploaded_spec.name.lower().endswith(".raml"):
         target = first_raml_target(root)
         target.parent.mkdir(parents=True, exist_ok=True)
         with open(target, "wb") as f:
             f.write(spec_bytes)
         modificados.append(str(target.relative_to(root)))
+        try:
+            resources_for_readme = parse_resources_from_raml(spec_bytes.decode("utf-8","ignore"))
+        except Exception:
+            resources_for_readme = {}
 
-    # Empaquetar
+    # === SCAFFOLD client/handler + common-error-handler (antes de rúbricas) ===
+    if resources_for_readme:
+        created_ch = scaffold_client_handler(root, resources_for_readme, ctx.get("general_path"))
+        if created_ch:
+            modificados.extend(created_ch)
+
+    # === SCAFFOLD orchestrators (antes de rúbricas) ===
+    if resources_for_readme:
+        created_orch = scaffold_orchestrators(root, resources_for_readme)
+        if created_orch:
+            modificados.extend(created_orch)
+
+    # === RÚBRICAS (estructura y nombres) ===
+    rubric_errors = enforce_rubrics_on_tree(root, spec_bytes)
+
+    # Script de validación para CI/CD
+    write_validate_script(root)
+
+    # README opcional con tabla de correlación
+    if resources_for_readme:
+        try:
+            write_min_readme(root, resources_for_readme)
+        except Exception:
+            pass
+
+    if rubric_errors:
+        raise RuntimeError("Rúbricas BLOQUEANTES:\n- " + "\n- ".join(rubric_errors))
+
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for p in root.rglob("*"):
             z.write(p, p.relative_to(root))
@@ -413,11 +718,11 @@ def manejar_mensaje(user_input: str):
             st.session_state.uploaded_spec.seek(0)
             spec_bytes = st.session_state.uploaded_spec.read()
 
-        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo archivos del arquetipo con ChatGPT + postprocesos (flows/TLS)..."})
+        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo archivos del arquetipo con ChatGPT + scaffolds (client/handler/orchestrators) + rúbricas..."})
         try:
             salida_zip, modificados, errores = procesar_arquetipo_llm(arquetipo, ctx, spec_bytes)
             st.session_state.generated_zip = salida_zip
-            resumen = f"✅ Proyecto generado. Archivos modificados: {len(modificados)}"
+            resumen = f"✅ Proyecto generado. Archivos modificados/creados: {len(modificados)}"
             if errores:
                 resumen += f"\n⚠️ Validaciones/Fallbacks: {len(errores)} (mostrando hasta 5):\n- " + "\n- ".join(errores[:5])
             st.session_state.messages.append({"role":"assistant","content":resumen})
