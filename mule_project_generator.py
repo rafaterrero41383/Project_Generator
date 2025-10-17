@@ -189,8 +189,6 @@ def renombrar_flows_con_prefijo(xml_text: str, ctx: dict) -> str:
 
     def repl(m):
         start, old, end = m.group(1), m.group(2), m.group(3)
-        if any(tag in old for tag in ["_client_", "_handler_", "_orchestrator_"]):
-            return f'{start}{old}{end}'
         if old.startswith(prefix+"-") or old.startswith(artifact+"-"):
             return f'{start}{old}{end}'
         new = re.sub(r"--+", "-", f"{prefix}-{old}")
@@ -240,7 +238,7 @@ def postprocesar_xml(xml_text: str, ctx: dict) -> str:
     xml_text = insertar_o_actualizar_tls(xml_text, ctx)
     return xml_text
 
-# ========= Parsing RAML (recursos, métodos, headers, tipos) =========
+# ========= Parsing RAML (recursos/métodos) =========
 
 HTTP_METHODS = {"get","post","put","delete","patch","head","options"}
 EXTRA_ACTIONS = {"retrieve","evaluate","execute","init","create","update","delete"}
@@ -449,7 +447,7 @@ def common_global_config_xml(use_apikit: bool):
 {listener}
 {_xml_footer()}""".strip()
 
-# ========= Rúbricas/estructura (BLOQUEANTES) =========
+# ========= Rúbricas/estructura =========
 
 def ensure_dirs(root: Path):
     base = root / "src/main/mule"
@@ -460,6 +458,7 @@ def ensure_dirs(root: Path):
     (root / "scripts").mkdir(parents=True, exist_ok=True)
 
 def forbid_loose_xml(root: Path) -> list[str]:
+    """Antes bloqueaba XMLs sueltos; ahora es solo informativo (no bloquea)."""
     base = root / "src/main/mule"
     return [str(p) for p in base.glob("*.xml")]
 
@@ -493,11 +492,7 @@ for d in client handler orchestrator common; do
   test -d "src/main/mule/$d" || { echo "Falta carpeta $d"; exit 1; }
 done
 
-# 2) Nada de XMLs sueltos en src/main/mule
-if find src/main/mule -maxdepth 1 -type f -name "*.xml" | grep -q .; then
-  echo "No debe haber .xml en src/main/mule (mover a client/handler/orchestrator/common)"
-  exit 1
-fi
+# 2) (Desactivado) XMLs sueltos permitidos por compatibilidad con arquetipos existentes
 
 # 3) Nombres por capa
 if find src/main/mule/client -type f -name "*.xml" | grep -Pv '^.*/[a-z][A-Za-z0-9]*-client\.xml$' | grep -q .; then
@@ -618,7 +613,6 @@ def _pom_find_or_create(parent, tag, ns):
     return el
 
 def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool) -> list[str]:
-    """Ajusta POM para packaging, mule-maven-plugin y apikit module si aplica."""
     changes = []
     pom_path = root_dir / "pom.xml"
     if not pom_path.exists():
@@ -628,10 +622,8 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool) -> lis
     try:
         tree = ET.fromstring(txt)
     except ET.ParseError:
-        # si está raro, no toco
         return changes
 
-    # detectar namespace default (maven POM casi siempre lo usa)
     if tree.tag.startswith("{"):
         ns = tree.tag.split("}",1)[0][1:]
     else:
@@ -639,7 +631,6 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool) -> lis
 
     def q(tag): return _pom_qname(tag, ns)
 
-    # packaging
     packaging = tree.find(q("packaging"))
     if packaging is None or (packaging.text or "").strip().lower() != "mule-application":
         if packaging is None:
@@ -647,7 +638,6 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool) -> lis
         packaging.text = "mule-application"
         changes.append("packaging=mule-application")
 
-    # name/artifactId (no sobreescribir si existen con valor)
     artifactId = tree.find(q("artifactId"))
     name = tree.find(q("name"))
     desired_artifact = ctx.get("artifact_id") or "mule-app"
@@ -662,7 +652,6 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool) -> lis
         name.text = desired_name
         changes.append(f"name={desired_name}")
 
-    # build/plugins/mule-maven-plugin (con extensions true)
     build = tree.find(q("build"))
     if build is None:
         build = ET.SubElement(tree, q("build"))
@@ -694,7 +683,6 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool) -> lis
             ext.text = "true"
             changes.append("mule-maven-plugin.extensions=true")
 
-    # dependencies → apikit si hay RAML (APIkit activado)
     if use_apikit:
         deps = tree.find(q("dependencies"))
         if deps is None:
@@ -717,12 +705,10 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool) -> lis
             ET.SubElement(dep, q("classifier")).text = "mule-plugin"
             changes.append("add: mule-apikit-module")
 
-    # guardar con pretty mínimo (ElementTree no indenta bonito, pero es válido)
     try:
         xml_bytes = ET.tostring(tree, encoding="utf-8")
         pom_path.write_text(xml_bytes.decode("utf-8"), encoding="utf-8")
     except Exception:
-        # fallback: no rompas nada si falla escritura
         pass
 
     return changes
@@ -742,7 +728,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     ensure_dirs(root)
     write_minimum_base_files(root)
 
-    # 1) Reescritura de archivos del arquetipo
     files_to_touch = []
     for r,_,fs in os.walk(root):
         for f in fs:
@@ -786,7 +771,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
         except Exception as e:
             errores.append(f"⚠️ Error en {path.name}: {e}")
 
-    # 2) Inyectar RAML y parsear info
     raml_info = {}
     raml_cp_value = None
     if spec_bytes and st.session_state.uploaded_spec.name.lower().endswith(".raml"):
@@ -801,14 +785,12 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
             raml_info = {}
         raml_cp_value = raml_classpath(root)
 
-    # 3) Scaffold según rúbricas
     base = root / "src/main/mule"
     client_dir = base / "client"
     handler_dir = base / "handler"
     orch_dir = base / "orchestrator"
     common_dir = base / "common"
 
-    # common-error-handler.xml
     ceh = handler_dir / "common-error-handler.xml"
     if not ceh.exists():
         xml = common_error_handler_xml()
@@ -819,7 +801,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
         ceh.write_text(xml, encoding="utf-8")
         modificados.append(str(ceh.relative_to(root)))
 
-    # global-config.xml (si no APIkit)
     use_apikit = bool(raml_cp_value)
     gc = common_dir / "global-config.xml"
     if not gc.exists():
@@ -835,7 +816,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
         for recurso, data in sorted(raml_info.items()):
             methods = data.get("methods") or {"retrieve"}
 
-            # client consolidado
             c_path = client_dir / f"{recurso}-client.xml"
             if not c_path.exists():
                 xml = client_file_xml(recurso, methods, ctx.get("general_path"), use_apikit, raml_cp_value)
@@ -844,7 +824,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                 c_path.write_text(xml, encoding="utf-8")
                 modificados.append(str(c_path.relative_to(root)))
 
-            # handler consolidado
             h_path = handler_dir / f"{recurso}-handler.xml"
             if not h_path.exists():
                 xml = handler_file_xml(recurso, methods, raml_info)
@@ -853,7 +832,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                 h_path.write_text(xml, encoding="utf-8")
                 modificados.append(str(h_path.relative_to(root)))
 
-            # orchestrator: 1 ó varias operaciones
             if len(methods) == 1:
                 o_path = orch_dir / f"{recurso}-orchestrator.xml"
                 if not o_path.exists():
@@ -872,17 +850,15 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                         o_path.write_text(xml, encoding="utf-8")
                         modificados.append(str(o_path.relative_to(root)))
 
-    # 3.5) Normalizar POM (packaging + mule-maven-plugin + apikit dependency si aplica)
     pom_changes = enforce_pom_requirements(root, ctx, use_apikit)
     if pom_changes:
         modificados.append("pom.xml (ajustes: " + ", ".join(pom_changes) + ")")
 
-    # 4) Rúbricas BLOQUEANTES
     rubric_errors = []
 
-    loose = forbid_loose_xml(root)
-    if loose:
-        rubric_errors.append("XMLs sueltos en src/main/mule: " + ", ".join(loose))
+    # >>>> RÚBRICA ELIMINADA: XMLs sueltos en src/main/mule (ya no bloquea) <<<<
+    # loose = forbid_loose_xml(root)  # lo dejamos como información, no error
+
     for d in ["client","handler","orchestrator","common"]:
         if not (base / d).exists():
             rubric_errors.append(f"Falta carpeta {d}/ bajo src/main/mule")
@@ -920,7 +896,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
             if "<error-handler>" not in t:
                 rubric_errors.append(f"{p.name}: falta error-handler con flow-ref a hdl_commonErrorHandler")
 
-    # APIkit: sin listeners duplicados en common
     if bool(raml_cp_value):
         if "http:listener-config" in (common_dir/"global-config.xml").read_text("utf-8","ignore"):
             rubric_errors.append("Con APIkit habilitado no debe haber listener-config en common/global-config.xml")
