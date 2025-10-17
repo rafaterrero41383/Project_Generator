@@ -1,0 +1,138 @@
+#%RAML 1.0
+title: Starwars
+documentation:
+  - title: API that allows to retrieve the information of ALL Stawars characters
+    content: The purpose of this API is to obtain all Starwars characters. 
+description: API Starwars
+version: v1
+mediaType: application/csv
+protocols:
+  - HTTPS
+
+#securedBy: [auth.oauth2]
+
+#uses:
+#  auth: libraries/oauth.raml
+
+# All data types are defined both as request and response, it is mostly the data model
+
+types:
+  responseAllCharacters: !include /dataTypes/allCharacters.raml
+  responseError: !include /dataTypes/errorResponse.raml
+
+/healthcheck:
+  displayName: healthcheck
+  description: get status healthcheck
+  get:
+    displayName: Method Get healthcheck
+    description: get status depedencies
+    headers:
+      token:
+        description: Set token
+        example: 42b088a5-0780-4935-8b4c-033b8d625e82
+        required: true
+    responses:
+          200:
+            description: Success
+            headers:
+              Content-Type:
+                description: header application/json
+                type: string
+                example: |
+                       {
+                          "status":"up",
+                          "name":"starwars",
+                          "server":{
+                              "host":"hostname",
+                              "ip":"192.169.1.101",
+                              "timestamp":"2019-02-13T14:23:00.120"
+                          },
+                          "backends":[
+                              {
+                                "system":"api-system"
+                              }
+                          ],
+                          "dependencies":[
+                              
+                          ]
+                        }
+            body:
+              type: file
+              fileTypes: ['application/csv']
+              example: !include /examples/allCharacters.raml
+          400:
+            description: Bad Request
+            headers:
+              Content-Type:
+                description: header application/json
+                type: string
+                example: application/json
+            body:
+              application/json:
+                  type: responseError
+                  example: !include /examples/badRequest.raml
+          401:
+            description: Unauthorized
+            headers:
+              Content-Type:
+                description: header application/json
+                type: string
+                example: application/json
+            body:
+              application/json:
+                  type: responseError
+                  example: !include /examples/unauthorized.raml
+
+
+/starwars:
+  /characters:
+    displayName: All characters
+    description: All characters
+    get:
+      displayName: Method GET All characters
+      description: Method GET
+      headers:
+        token:
+          description: Set Token
+          example: 42b088a5-0780-4935-8b4c-033b8d625e82
+          required: true
+      queryParameters:
+        gender: 
+          description: type gender
+          type: string | nil
+          enum: [female, male, n/a]
+          required: false
+      responses:
+            200:
+              description: Success
+              headers:
+                Content-Type:
+                  description: header application/csv
+                  type: string
+                  example: application/csv
+              body:
+                type: file
+                fileTypes: ['application/csv']
+                example: !include /examples/allCharacters.raml
+            400:
+              description: Bad Request
+              headers:
+                Content-Type:
+                  description: header application/json
+                  type: string
+                  example: application/json
+              body:
+                application/json:
+                    type: responseError
+                    example: !include /examples/badRequest.raml
+            401:
+              description: Unauthorized
+              headers:
+                Content-Type:
+                  description: header application/json
+                  type: string
+                  example: application/json
+              body:
+                application/json:
+                    type: responseError
+                    example: !include /examples/unauthorized.raml

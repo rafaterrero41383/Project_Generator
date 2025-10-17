@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:validation="http://www.mulesoft.org/schema/mule/validation" xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/validation http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd">
+	<sub-flow name="sub-flow-validate-token" doc:id="42cc69cd-2cda-4f01-b8ba-d497a124a206" >
+		<try doc:name="Try" doc:id="874defa9-9898-4da4-b843-866e2ba301e1" >
+			<logger level="INFO" doc:name="Logger-Request" doc:id="8e990023-29bb-4533-8648-e2b918765493" message="#[attributes.headers]" />
+			<validation:is-not-null doc:name="Validamos Token" doc:id="e6a51374-2f62-4e9b-be31-6615bb2ac957" value="#[attributes.headers.token]"/>
+			<choice doc:name="Choice" doc:id="05417c97-2732-4fda-ab0c-adc11fa64407" >
+				<when expression="#[isEmpty(attributes.headers.token)]">
+					<raise-error doc:name="Raise error" doc:id="f6a3430b-20ef-436c-a9f2-7cad03f325c1" description="Required header token is missing." type="BC-MX:TOKEN"/>
+				</when>
+				<otherwise >
+					<flow-ref doc:name="Backup Mule Event" doc:id="d210d87b-fec7-4d5c-b35e-9aecc425fb86" name="backupSub_Flow" />
+					<http:request method="POST" doc:name="Validate token" doc:id="e35e91b0-b14a-47c4-8f2a-cae577fdbc1f" config-ref="HTTP_Request_party-identity_configuration" path="${partyIdentify.path}">
+				<error-mapping sourceType="HTTP:UNAUTHORIZED" targetType="BC-MX:TOKEN" />
+				<http:headers><![CDATA[#[output application/java
+---
+{
+	"Authorization" : attributes.headers.token,
+	"X-Coppel-Latitude" : "${token.latitude}",
+	"X-Coppel-TransactionId" : "${token.transactionId}",
+	"X-Coppel-Date-Request" : "${token.dateRequest}",
+	"X-Coppel-Longitude" : "${token.longitude}"
+}]]]></http:headers>
+			</http:request>
+					<ee:transform doc:name="Restore Mule Event" doc:id="209a4409-0891-4a54-bbd2-8f19bcfe1df7">
+				<ee:message>
+					<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+vars.backupPayload]]></ee:set-payload>
+					<ee:set-attributes><![CDATA[%dw 2.0
+output application/java
+---
+vars.varAttributes]]></ee:set-attributes>
+				</ee:message>
+			</ee:transform>
+					<logger level="INFO" doc:name="Logger-Response" doc:id="cb248b22-93c6-4e82-96cf-0bbc70f3bc2c" message="#[payload]" />
+				</otherwise>
+			</choice>
+			<error-handler >
+				<on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate" doc:id="dec75344-3d3f-4b7a-ace5-d4afed24da91" type="VALIDATION:NULL">
+					<raise-error doc:name="Raise error" doc:id="0e951097-0918-461f-b9ed-cd3a78ac5978" description="Required header token is missing." type="BC-MX:TOKEN"/>
+				</on-error-propagate>
+				<on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate" doc:id="4e7e4672-dd8f-4100-ac1c-796b9c16a593" type="HTTP:BAD_REQUEST">
+					<raise-error doc:name="Raise error" doc:id="360320d1-9979-4e89-b29c-769ccbec7929" type="BC-MX:TOKEN" description="Required header token is missing." />
+				</on-error-propagate>
+			</error-handler>
+		</try>
+	</sub-flow>
+	<sub-flow name="backupSub_Flow" doc:id="4dcd25cb-3ebb-4451-8450-142a0c06f962" >
+		<ee:transform doc:name="Set Backup Mule Event" doc:id="24bad0b7-6a48-4d9c-9cc9-0ae8927a89be" >
+			<ee:message >
+			</ee:message>
+			<ee:variables >
+				<ee:set-variable variableName="backupPayload" ><![CDATA[%dw 2.0
+output application/java
+---
+payload]]></ee:set-variable>
+				<ee:set-variable variableName="varAttributes" ><![CDATA[%dw 2.0
+output application/java
+---
+attributes]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+	</sub-flow>
+</mule>

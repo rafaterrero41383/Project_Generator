@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core" xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+	<sub-flow name="get-healthcheckSub_Flow" doc:id="5cea66c7-0080-46df-8f4d-af8b2e639af3" >
+		<logger level="INFO" doc:name="Client Log" doc:id="c35729aa-d07e-4a6e-8f1d-41c02c8e2eea" message="#['Healthcheck - CorrelationId: ' ++ correlationId]" />
+		<!-- [STUDIO:"Example Response"]<ee:transform doc:name="Example Response" doc:id="2ad2622e-94d1-455c-aef1-04f25b9c7143" >
+			<ee:message >
+				<ee:set-payload ><![CDATA[%dw 2.0
+output application/json
+&#45;&#45;-
+{
+  "status": "up",
+  "name": "msach-b-business-applications",
+  "server": {
+    "host": "api.bcpl-bex-osd.v49u.p1.com",
+    "ip": "192.169.1.26",
+    "timestamp": "2023-12-31 23:59:59"
+  },
+  "backends": [
+    {
+      "typeApi": "business",
+      "name": "msach-b-business",
+      "status": "up"
+    },
+    {
+      "typeApi": "domain",
+      "name": "msach-b-domain",
+      "status": "up"
+    }
+  &#93;,
+  "dependencies": [
+    {
+      "typeDependencies": "db",
+      "name": "mysql.dev",
+      "status": "up"
+    },
+    {
+      "typeDependencies": "redis",
+      "name": "redis.dev",
+      "status": "up"
+    }
+  &#93;
+}&#93;&#93;></ee:set-payload>
+			</ee:message>
+		</ee:transform> [STUDIO] -->
+		<try doc:name="Try healtcheck" doc:id="f6de6bea-f8e8-4f0c-94fc-43665e76519b" >
+			<scatter-gather doc:name="Scatter-Gather" doc:id="f3a2fd48-225f-4a69-804f-565abe68e527">
+			<route>
+				<flow-ref doc:name="get-sales-partyLifecycleManagement-client-healthcheck-Sub_Flow" doc:id="6c92dc1a-dfd3-468f-82bc-b7ff2cd69157" name="get-sales-partyLifecycleManagement-client-handlerSub_Flow" />
+			</route>
+			<route>
+				<flow-ref doc:name="post-sales-partyLifecycleManagement-client-healthcheck-Sub_Flow" doc:id="dce0f9ca-a0eb-4aa3-8461-75444318d892" name="post-sales-partyLifecycleManagement-client-handlerSub_Flow" />
+					<ee:transform doc:name="Response Up" doc:id="24cf2cf0-0927-4134-8b7b-bc74a1882862">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: "up",
+  name: "msach-b-business-applications",
+  server: {
+    host: "api.bcpl-bex-osd.v49u.p1.com",
+    ip: "192.169.1.26",
+    timestamp: "2023-12-31 23:59:59"
+  },
+  backends: [
+    {
+      typeApi: "business",
+      name: "msach-b-business",
+      status: if (payload[0].typedAttributes.statusCode == 200)
+      			"up" 
+      		  else ("down")
+    }, 
+    {
+      typeApi: "domain",
+      name: "msach-b-domain",
+      status: if (payload[1].typedAttributes.statusCode == 200)
+      			"up" 
+      		  else ("down")
+    }
+  ],
+  dependencies: [
+    {
+      typeDependencies: "db",
+      name: "mysql.dev",
+      status: "up"
+    }, 
+    {
+      typeDependencies: "redis",
+      name: "redis.dev",
+      status: "up"
+    }
+  ]
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+			</route>
+		</scatter-gather>
+			<error-handler >
+				<on-error-continue enableNotifications="true" logException="true" doc:name="On Error Continue" doc:id="fed0b532-1f54-4959-9f29-eb98b1009feb" >
+					<ee:transform doc:name="Transform Message" doc:id="4815efce-d1b1-415d-910a-6d3bf5c823be" >
+						<ee:message >
+							<ee:set-payload ><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: "down",
+  name: "msach-b-business-applications",
+  server: {
+    host: "api.bcpl-bex-osd.v49u.p1.com",
+    ip: "192.169.1.26",
+    timestamp: "2023-12-31 23:59:59"
+  },
+  backends: [
+    {
+      typeApi: "business",
+      name: "msach-b-business",
+      status: if (payload[0].typedAttributes.statusCode == 200)
+      			"up" 
+      		  else ("down")
+    }, 
+    {
+      typeApi: "domain",
+      name: "msach-b-domain",
+      status: if (payload[1].typedAttributes.statusCode == 200)
+      			"up" 
+      		  else ("down")
+    }
+  ],
+  dependencies: [
+    {
+      typeDependencies: "db",
+      name: "mysql.dev",
+      status: "up"
+    }, 
+    {
+      typeDependencies: "redis",
+      name: "redis.dev",
+      status: "up"
+    }
+  ]
+}]]></ee:set-payload>
+						</ee:message>
+					</ee:transform>
+				</on-error-continue>
+			</error-handler>
+		</try>
+	</sub-flow>
+</mule>

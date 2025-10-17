@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+	xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd 
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd">
+	<configuration-properties doc:name="Configuration properties" doc:id="cf69261d-ef25-4737-af3e-fbb9bd26d0ef" file="properties\\${mule.env}-properties.yaml" />
+	<global-property doc:name="Global Property" doc:id="d4291fcf-449b-4ac7-9323-7441a30b009e" name="mule.env" value="local"/>
+    <http:listener-config name="starwars-httpListenerConfig">
+        <http:listener-connection host="0.0.0.0" port="${http.listener.port}" />
+    </http:listener-config>
+	<http:request-config name="HTTP_Request_configuration_starwars" doc:name="HTTP Request configuration" doc:id="b98d97a7-666c-46a6-b290-9a5a594442d7" >
+		<http:request-connection host="${starwars.host}" protocol="${starwars.protocol}" connectionIdleTimeout="${timeoutRq}"/>
+	</http:request-config>
+	<http:request-config name="HTTP_Request_party-identity_configuration" doc:name="HTTP Request configuration" doc:id="a6e8caa5-7d26-4f8e-ada2-9d62b4206c2a" basePath="${partyIdentify.basePath}" >
+		<http:request-connection host="${partyIdentify.host}" protocol="HTTPS"/>
+	</http:request-config>    
+</mule>

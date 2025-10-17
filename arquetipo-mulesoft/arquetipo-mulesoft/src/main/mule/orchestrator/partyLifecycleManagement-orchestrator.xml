@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core" xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+	<sub-flow name="get-sales-partyLifecycleManagement-client-orchestratorSub_Flow" doc:id="4ffa12cc-7f3f-45b2-9345-db3a8bbc8c15" >
+		<logger level="INFO" doc:name="Logger" doc:id="26a358ac-4858-418a-bc37-a965ba849d30" message="#['Get Characters Orchestrator - CorrelationId: ' ++ correlationId]"/>
+		<ee:transform doc:name="Obtiene Characters" doc:id="d898ab41-9bcd-4977-8733-5c577d1e86c9">
+			<ee:message>
+			</ee:message>
+			<ee:variables>
+				<ee:set-variable resource="dwl/get-transform-sales-orchestrator.dwl" variableName="characters" />
+			</ee:variables>
+		</ee:transform>
+		<flow-ref doc:name="get-characters-clientSub_Flow" doc:id="84ab9625-4fc2-4cf9-b8d0-879bbedc0106" name="get-proxy-partyLifecycleManagement-client-Sub_Flow" />
+	</sub-flow>
+	<sub-flow name="post-sales-partyLifecycleManagement-client-orchestratorSub_Flow" doc:id="39ee4d1f-5083-416b-941b-379dad119310" >
+		<logger level="INFO" doc:name="Logger" doc:id="5507b45c-67a2-4d23-8f44-6b6476cb1325" message="#['Get Characters Orchestrator - CorrelationId: ' ++ correlationId]" />
+		<ee:transform doc:name="Obtiene Characters" doc:id="1a7f9186-0660-4d9c-8934-666130b1a98d">
+			<ee:message />
+			<ee:variables>
+				<ee:set-variable resource="dwl/post-transform-sales-orchestrator.dwl" variableName="characters" />
+			</ee:variables>
+		</ee:transform>
+		<flow-ref doc:name="post-proxy-partyLifecycleManagement-client-Sub_Flow" doc:id="2f262ac0-c272-42f6-95c0-7faf54f67a74" name="post-proxy-partyLifecycleManagement-client-Sub_Flow" />
+	</sub-flow>
+	<sub-flow name="put-sales-partyLifecycleManagement-client-orchestratorSub_Flow" doc:id="30ae8c7c-53e3-441c-8a35-052d9c998730" >
+		<logger level="INFO" doc:name="Logger" doc:id="d1680852-1b42-4054-bdae-2da4788fb761" message="#['Get Characters Orchestrator - CorrelationId: ' ++ correlationId]" />
+		<ee:transform doc:name="Obtiene Characters" doc:id="05597625-8f71-4f38-bbdb-8ebc093776b3">
+			<ee:message />
+			<ee:variables>
+				<ee:set-variable resource="dwl/put-transform-sales-orchestrator.dwl" variableName="characters" />
+			</ee:variables>
+		</ee:transform>
+		<flow-ref doc:name="put-proxy-partyLifecycleManagement-client-Sub_Flow" doc:id="be2ac7f1-d74e-404f-b8d7-90a881f754e5" name="put-proxy-partyLifecycleManagement-client-Sub_Flow" />
+	</sub-flow>
+</mule>
