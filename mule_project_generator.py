@@ -1,8 +1,7 @@
-import tempfile, zipfile, re, os, io, json, sys, types
+import tempfile, zipfile, re, os, sys, types
 import xml.etree.ElementTree as ET
 import yaml
 from pathlib import Path
-from urllib.parse import urlparse
 
 # --- Parche compatibilidad 3.13 ---
 if 'imghdr' not in sys.modules:
@@ -60,6 +59,8 @@ if spec and st.session_state.uploaded_spec is None:
 
 # ========= Utilidades =========
 
+TEXT_EXTS = {".xml",".json",".yaml",".yml",".raml",".properties",".txt",".pom",".md"}
+
 def leer_especificacion(file) -> str:
     name = file.name.lower()
     file.seek(0)
@@ -110,7 +111,7 @@ base_path: path sin host, sin query, sin protocolo; sin barra inicial (string o 
 general_path: path del listener para ${general.path} (string, ej: "/api/*")
 upstream_host: host del sistema objetivo (string o null)
 upstream_protocol: HTTP/HTTPS (string o null)
-upstream_path: path base para http:request (string, ej: "/v1/renapo/evaluate")
+upstream_path: path base para http:request (string, ej: "/v1/sistema/endpoint")
 media_type: mediaType del RAML si existe (string o null)
 protocols: protocolos del RAML (string o null, separados por coma o null)
 endpoints: lista de endpoints "raíz" del RAML (array de strings)
@@ -148,7 +149,6 @@ def inferir_metadatos(contenido_api: str) -> dict:
     data.setdefault("version","1.0.0")
     data.setdefault("group_id","com.company.experience")
     data.setdefault("general_path","/api/*")
-    # herencia upstream_* desde campos RAML
     data.setdefault("upstream_host", data.get("host_name"))
     data.setdefault("upstream_protocol", data.get("protocol"))
     if not data.get("upstream_path"):
@@ -176,66 +176,24 @@ def aplicar_perfil_por_capa(ctx: dict) -> dict:
                 ctx["general_path"] = f"/{pref_map[capa]}/*"
     return ctx
 
-# ========= Parte 2: Reescritura de archivos con ChatGPT =========
-
-PROMPT_FILE = """Eres un configurador experto de proyectos Mule 4.
-Objetivo: actualizar el archivo indicado usando los METADATOS (YAML) provistos.
-
-Instrucciones estrictas:
-- Mantén el MISMO formato y los mismos saltos de línea.
-- No agregues explicaciones, comentarios extra ni bloques ```.
-- Sigue los comentarios guía (por ejemplo los marcados con "====") y sustituye valores acordes.
-- Sustituye placeholders o literales relevantes (groupId, artifactId, version, name, project.mule.name, http listener path/port, http request host/protocol/path, exchange.json main/assetId/groupId/name/version, propiedades YAML app/general/upstream).
-- Si un valor del contexto es null, NO lo inventes; deja el original.
-- No elimines secciones no relacionadas.
-
-Responde **solo** con el contenido final del archivo, sin texto extra.
-
-=== METADATOS (YAML) ===
-{ctx_yaml}
-
-=== ARCHIVO ({fname}) ORIGINAL ===
-{original}
-"""
-
-def limpiar_contenido_llm(raw: str) -> str:
-    blocks = re.findall(r"```(?:xml|yaml|yml|json|properties|txt)?\s*(.*?)```", raw, re.DOTALL)
-    if blocks:
-        return blocks[-1].strip()
-    return raw.strip()
-
-def transformar_archivo_con_gpt(fname: str, original: str, ctx: dict) -> str:
-    ctx_yaml = yaml.safe_dump(ctx, sort_keys=False, allow_unicode=True)
-    raw = _gpt([
-        {"role":"system","content":"Actúa como refactorizador determinista de archivos Mule/Java/XML/YAML/JSON."},
-        {"role":"user","content": PROMPT_FILE.format(ctx_yaml=ctx_yaml, fname=fname, original=original)}
-    ], temperature=0.1)
-    contenido = limpiar_contenido_llm(raw)
-    if not contenido or len(contenido.splitlines()) < max(3, int(len(original.splitlines())*0.3)):
-        return original
-    return contenido
-
-# ========= Parte 2.5: Postprocesos deterministas (flows + TLS) =========
+# ========= Postprocesos deterministas (flows + TLS) =========
 
 def _safe_sub(rx, text, repl_fn, count=0):
     r = re.compile(rx, re.DOTALL)
     return r.sub(lambda m: repl_fn(m), text, count=count)
 
-def _already_prefixed(name: str, prefix: str) -> bool:
-    p = prefix.lower()
-    return name.lower().startswith(p + "-") or name.lower().startswith(p + ":")
-
-def renombrar_flows(xml_text: str, ctx: dict) -> str:
+def renombrar_flows_con_prefijo(xml_text: str, ctx: dict) -> str:
     artifact = ctx.get("artifact_id", "app")
     layer = ctx.get("layer_prefix")
     prefix = f"{layer}-{artifact}" if layer else artifact
 
     def repl(m):
         start, old, end = m.group(1), m.group(2), m.group(3)
-        if _already_prefixed(old, prefix) or _already_prefixed(old, artifact):
+        if any(tag in old for tag in ["_client_", "_handler_", "_orchestrator_"]):
             return f'{start}{old}{end}'
-        new = f"{prefix}-{old}"
-        new = re.sub(r"--+", "-", new)
+        if old.startswith(prefix+"-") or old.startswith(artifact+"-"):
+            return f'{start}{old}{end}'
+        new = re.sub(r"--+", "-", f"{prefix}-{old}")
         return f'{start}{new}{end}'
 
     xml_text = _safe_sub(r'(<flow\s+name=")([^"]+)(")', xml_text, repl)
@@ -271,95 +229,71 @@ def insertar_o_actualizar_tls(xml_text: str, ctx: dict) -> str:
             return tag[:-1] + ' tlsContext-ref="default-tls"'
         return repl
 
-    # condición con upstream_protocol
     if (ctx.get("upstream_protocol") or "").upper() == "HTTPS" or 'protocol="HTTPS"' in xml_text:
         xml_text = _safe_sub(r'(<http:request-connection\b[^>]*)(/?>)', xml_text, add_tls_ref(r""), count=0)
         xml_text = _safe_sub(r'(<http:listener-connection\b[^>]*)(/?>)', xml_text, add_tls_ref(r""), count=0)
 
     return xml_text
 
-def postprocesar_xml(xml_text: str, fname: str, ctx: dict) -> str:
-    name = fname.lower()
-    if name.endswith(".xml"):
-        xml_text = renombrar_flows(xml_text, ctx)
+def postprocesar_xml(xml_text: str, ctx: dict) -> str:
+    xml_text = renombrar_flows_con_prefijo(xml_text, ctx)
     xml_text = insertar_o_actualizar_tls(xml_text, ctx)
     return xml_text
 
-# ========= RÚBRICAS y utilidades =========
+# ========= Parsing RAML (recursos, métodos, headers, tipos) =========
 
-VALID_ACTIONS = {"retrieve","evaluate","execute","init","create","update","delete"}
+HTTP_METHODS = {"get","post","put","delete","patch","head","options"}
+EXTRA_ACTIONS = {"retrieve","evaluate","execute","init","create","update","delete"}
 
-def ensure_dirs(root: Path):
-    base = root / "src/main/mule"
-    for d in ["client", "handler", "orchestrator", "common"]:
-        (base / d).mkdir(parents=True, exist_ok=True)
-
-def forbid_loose_xml(root: Path) -> list[str]:
-    base = root / "src/main/mule"
-    bad = []
-    for p in base.glob("*.xml"):
-        bad.append(str(p))
-    return bad
-
-def parse_resources_from_raml(raml_text: str) -> dict:
+def parse_raml_semilight(raml_text: str) -> dict:
+    lines = raml_text.splitlines()
     res = {}
-    for line in raml_text.splitlines():
-        line = line.strip()
-        if line.startswith("/"):
-            parts = [x for x in line.split("/") if x]
-            if not parts:
-                continue
-            recurso = parts[0]
-            action = parts[-1].lower()
-            name = recurso[0].lower()+recurso[1:] if recurso else "resource"
-            res.setdefault(name, set())
-            if action in VALID_ACTIONS:
-                res[name].add(action)
+    cur_res = None
+    cur_method = None
+
+    for i, raw in enumerate(lines):
+        line = raw.rstrip()
+        if not line or line.strip().startswith("#"):
+            continue
+
+        if line.lstrip().startswith("/"):
+            cur_res = line.strip().split()[0].strip("/").split("/")[0]
+            res.setdefault(cur_res, {"methods": set(), "headers_required": {}, "req_types": {}, "res_types": {}})
+            cur_method = None
+            continue
+
+        token = line.strip().rstrip(":").lower()
+        if token in HTTP_METHODS or token in EXTRA_ACTIONS:
+            cur_method = token
+            res.setdefault(cur_res, {"methods": set(), "headers_required": {}, "req_types": {}, "res_types": {}})
+            res[cur_res]["methods"].add(cur_method)
+            continue
+
+        if cur_method and line.strip().endswith(":") and "headers" in line.lower():
+            for j in range(i+1, min(i+7, len(lines))):
+                l2 = lines[j].strip()
+                if l2.endswith(":") and not l2.startswith("-"):
+                    hdr = l2.rstrip(":")
+                    block = "\n".join(lines[j: min(j+6, len(lines))]).lower()
+                    if "required: true" in block:
+                        res[cur_res]["headers_required"].setdefault(cur_method, []).append(hdr)
+
+        if cur_method and "body:" in line.lower():
+            block = "\n".join(lines[i: min(i+10, len(lines))])
+            m = re.search(r"type:\s*([A-Za-z0-9_\-\.]+)", block)
+            if m: res[cur_res]["req_types"][cur_method] = m.group(1)
+
+        if cur_method and "responses:" in line.lower():
+            block = "\n".join(lines[i: min(i+15, len(lines))])
+            m = re.search(r"200:\s*(?:\n|\r\n).*?type:\s*([A-Za-z0-9_\-\.]+)", block, re.DOTALL)
+            if m: res[cur_res]["res_types"][cur_method] = m.group(1)
+
+    for r, d in res.items():
+        if not d["methods"]:
+            d["methods"].add("retrieve")
     return res
 
-def canonical_names(api_resource: str, actions: set[str]) -> dict:
-    pascal = api_resource[0].upper()+api_resource[1:]
-    client = f"api{pascal}-client.xml"
-    handler = f"api{pascal}-handler.xml"
-    orch = [f"{api_resource}-{a}-orchestrator.xml" for a in (actions or {"retrieve"})]
-    return {"client": client, "handler": handler, "orchestrators": orch}
-
-def rename_if_needed(path: Path, expected_name: str):
-    if path.name != expected_name:
-        path.rename(path.with_name(expected_name))
-
-# ========= Helpers RAML → classpath =========
-
-def first_raml_target(dst_root: Path) -> Path:
-    """
-    Preferimos api.raml; si no existe, tomamos el primer *.raml encontrado.
-    """
-    preferred = dst_root / "src/main/resources/api/api.raml"
-    if preferred.parent.exists():
-        return preferred
-    existing = list(dst_root.rglob("*.raml"))
-    return existing[0] if existing else preferred
-
-def raml_classpath(root: Path) -> str|None:
-    """Devuelve classpath relativo del RAML (p.ej. 'classpath:/api/api.raml') si existe."""
-    target = first_raml_target(root)
-    try:
-        rel = target.relative_to(root / "src/main/resources")
-        return "classpath:/" + "/".join(rel.parts)
-    except Exception:
-        candidates = list(root.rglob("*.raml"))
-        if candidates:
-            try:
-                rel = candidates[0].relative_to(root / "src/main/resources")
-                return "classpath:/" + "/".join(rel.parts)
-            except Exception:
-                return None
-    return None
-
-# ========= SCAFFOLD: orchestrators, client, handler (con APIkit) =========
-
-def _flow_name(resource: str, suffix: str) -> str:
-    return f"{resource}-{suffix}"
+# ========= Scaffold XML strings (APIkit / no-APIkit) =========
 
 def _xml_header(apikit: bool=False):
     if apikit:
@@ -394,219 +328,164 @@ def _xml_header(apikit: bool=False):
 def _xml_footer():
     return "</mule>\n"
 
-def _orchestrator_xml_skeleton(resource: str, action: str) -> str:
-    flow_name = _flow_name(resource, f"{action}-orchestrator-main")
-    return f"""{_xml_header(False)}
-  <!-- Auto-generado: orchestrator base -->
-  <flow name="{flow_name}">
-    <logger level="INFO" message="[{resource}:{action}] start orchestration"/>
-    <!-- TODO: invocar subflows/client aquí -->
-    <logger level="INFO" message="[{resource}:{action}] end orchestration"/>
-  </flow>
-{_xml_footer()}""".strip()
+def _mk_error_handler_ref():
+    return """
+    <error-handler>
+      <on-error-continue logException="true" type="ANY">
+        <flow-ref name="hdl_commonErrorHandler"/>
+      </on-error-continue>
+    </error-handler>""".rstrip()
 
-def _client_xml_skeleton(resource_pascal: str, general_path: str, raml_cp: str|None) -> str:
-    """
-    Si raml_cp está presente, genera client con APIkit (listener + router).
-    Si no, genera un client mínimo con logger.
-    """
-    flow = f"api{resource_pascal}-client-main"
-    path = general_path if general_path else "/api/*"
-    if raml_cp:
-        return f"""{_xml_header(True)}
-  <!-- Auto-generado: client con APIkit -->
-  <http:listener-config name="api-httpListener">
+def client_file_xml(resource: str, methods: set, general_path: str, use_apikit: bool, raml_cp: str|None):
+    gp = general_path or "/api/*"
+    header = _xml_header(apikit=use_apikit)
+
+    flows = []
+    for m in sorted(methods):
+        fname = f"{resource}_client_{m}"
+        flows.append(f'''  <flow name="{fname}">
+    <logger level="INFO" message="[{resource}] client {m} start"/>
+    <flow-ref name="{resource}_handler_{m}"/>
+    <logger level="INFO" message="[{resource}] client {m} end"/>
+{_mk_error_handler_ref()}
+  </flow>''')
+
+    apikit_part = ""
+    if use_apikit and raml_cp:
+        apikit_part = f"""
+  <http:listener-config name="{resource}-httpListener">
     <http:listener-connection host="0.0.0.0" port="${{http.port}}"/>
   </http:listener-config>
 
-  <apikit:config name="api-config" raml="{raml_cp}"/>
+  <apikit:config name="{resource}-api-config" raml="{raml_cp}"/>
 
-  <flow name="{flow}">
-    <http:listener config-ref="api-httpListener" path="${{general.path}}" />
-    <apikit:router config-ref="api-config" />
+  <flow name="{resource}-http-inbound">
+    <http:listener config-ref="{resource}-httpListener" path="${{general.path}}"/>
+    <apikit:router config-ref="{resource}-api-config"/>
   </flow>
 
-  <!-- Consola (opcional) -->
-  <flow name="api-console">
-    <http:listener config-ref="api-httpListener" path="/console/*" />
-    <apikit:console config-ref="api-config" />
+  <flow name="{resource}-api-console">
+    <http:listener config-ref="{resource}-httpListener" path="/console/*"/>
+    <apikit:console config-ref="{resource}-api-config"/>
   </flow>
+""".rstrip()
+
+        impl = []
+        for m in sorted(methods):
+            apiflow = f"{m}:/"+resource
+            impl.append(f'''  <flow name="{apiflow}">
+    <flow-ref name="{resource}_client_{m}"/>
+{_mk_error_handler_ref()}
+  </flow>''')
+        apikit_part = apikit_part + "\n" + "\n".join(impl)
+
+    body = "\n".join(flows)
+    content = f"""{header}
+  <!-- client consolidado para recurso '{resource}' -->
+{apikit_part if apikit_part else ""}
+{body}
+{_xml_footer()}"""
+    return content.strip()
+
+def handler_file_xml(resource: str, methods: set, raml_info: dict):
+    header = _xml_header(False)
+    blocks = []
+    for m in sorted(methods):
+        req_headers = raml_info.get(resource, {}).get("headers_required", {}).get(m, []) if raml_info else []
+        hdr_sets = "\n".join([f'    <set-variable variableName="{h.replace("-", "_")}" value="#[attributes.headers.\'{h}\']"/>' for h in req_headers]) if req_headers else "    <!-- no required headers detected -->"
+        blocks.append(f'''  <flow name="{resource}_handler_{m}">
+{hdr_sets}
+    <flow-ref name="{resource}_orchestrator_{m}"/>
+{_mk_error_handler_ref()}
+  </flow>''')
+    return f"""{header}
+  <!-- handler consolidado para recurso '{resource}' -->
+{chr(10).join(blocks)}
+{_xml_footer()}""".strip()
+
+def orchestrator_file_xml(resource: str, methods: set, raml_info: dict, single_file: bool):
+    header = _xml_header(False)
+    if single_file:
+        blocks = []
+        for m in sorted(methods):
+            blocks.append(f'''  <flow name="{resource}_orchestrator_{m}">
+    <logger level="INFO" message="[{resource}] orchestrator {m} start"/>
+    <!-- TODO: mapping/externos según contrato RAML -->
+    <logger level="INFO" message="[{resource}] orchestrator {m} end"/>
+{_mk_error_handler_ref()}
+  </flow>''')
+        return f"""{header}
+  <!-- orchestrator consolidado para recurso '{resource}' -->
+{chr(10).join(blocks)}
 {_xml_footer()}""".strip()
     else:
-        return f"""{_xml_header(False)}
-  <!-- Auto-generado: client base -->
-  <flow name="{flow}">
-    <logger level="INFO" message="[client] request recibido en {path}"/>
+        m = next(iter(methods))
+        return f"""{header}
+  <flow name="{resource}_orchestrator_{m}">
+    <logger level="INFO" message="[{resource}] orchestrator {m} start"/>
+    <!-- TODO: mapping/externos según contrato RAML -->
+    <logger level="INFO" message="[{resource}] orchestrator {m} end"/>
+{_mk_error_handler_ref()}
   </flow>
 {_xml_footer()}""".strip()
 
-def _handler_xml_skeleton(resource_pascal: str) -> str:
-    flow = f"api{resource_pascal}-handler-main"
-    return f"""{_xml_header(False)}
-  <!-- Auto-generado: handler base -->
-  <flow name="{flow}">
-    <logger level="INFO" message="[handler] inicio manejo"/>
-    <!-- TODO: validaciones, mapping, llamadas a orchestrator -->
-    <logger level="INFO" message="[handler] fin manejo"/>
-  </flow>
-{_xml_footer()}""".strip()
-
-def _common_error_handler_xml() -> str:
-    return f"""{_xml_header(False)}
-  <!-- Auto-generado: common error handler -->
-  <sub-flow name="common-error-handler">
-    <logger level="ERROR" message="Error en flujo: #[error.description] - #[error.cause]"/>
+def common_error_handler_xml():
+    header = _xml_header(False)
+    return f"""{header}
+  <!-- common error handler -->
+  <sub-flow name="hdl_commonErrorHandler">
+    <logger level="ERROR" message="type=#[error.errorType] desc=#[error.description]"/>
   </sub-flow>
 {_xml_footer()}""".strip()
 
-def scaffold_orchestrators(root: Path, resources: dict) -> list[str]:
-    created = []
-    base = root / "src/main/mule/orchestrator"
-    base.mkdir(parents=True, exist_ok=True)
-    for resource, actions in (resources or {}).items():
-        planned = sorted(actions or {"retrieve"})
-        for action in planned:
-            fname = f"{resource}-{action}-orchestrator.xml"
-            path = base / fname
-            if not path.exists():
-                xml = _orchestrator_xml_skeleton(resource, action)
-                try:
-                    ET.fromstring(xml)
-                except ET.ParseError:
-                    xml = f"<mule><flow name='{_flow_name(resource, f'{action}-orchestrator-main')}'/></mule>"
-                path.write_text(xml, encoding="utf-8")
-                created.append(str(path.relative_to(root)))
-    return created
+def common_global_config_xml(use_apikit: bool):
+    header = _xml_header(False)
+    listener = "" if use_apikit else """
+  <http:listener-config name="global-httpListener">
+    <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+  </http:listener-config>""".rstrip()
+    return f"""{header}
+  <configuration-properties file="properties/application.properties"/>
+{listener}
+{_xml_footer()}""".strip()
 
-def scaffold_client_handler(root: Path, resources: dict, general_path: str, raml_cp: str|None) -> list[str]:
-    """
-    Crea client/handler y common-error-handler si faltan.
-    Si hay RAML → client incluye APIkit (listener + router + console).
-    """
-    created = []
+# ========= Rúbricas/estructura (BLOQUEANTES) =========
+
+def ensure_dirs(root: Path):
     base = root / "src/main/mule"
-    client_dir = base / "client"
-    handler_dir = base / "handler"
-    client_dir.mkdir(parents=True, exist_ok=True)
-    handler_dir.mkdir(parents=True, exist_ok=True)
+    for d in ["client", "handler", "orchestrator", "common"]:
+        (base / d).mkdir(parents=True, exist_ok=True)
+    (root / "src/main/resources/api").mkdir(parents=True, exist_ok=True)
+    (root / "src/main/resources/properties").mkdir(parents=True, exist_ok=True)
+    (root / "scripts").mkdir(parents=True, exist_ok=True)
 
-    # common-error-handler.xml
-    ceh = handler_dir / "common-error-handler.xml"
-    if not ceh.exists():
-        xml = _common_error_handler_xml()
-        try:
-            ET.fromstring(xml)
-        except ET.ParseError:
-            xml = "<mule><sub-flow name='common-error-handler'/></mule>"
-        ceh.write_text(xml, encoding="utf-8")
-        created.append(str(ceh.relative_to(root)))
-
-    for resource, actions in (resources or {}).items():
-        pascal = resource[0].upper()+resource[1:] if resource else "Resource"
-        # client
-        c_name = f"api{pascal}-client.xml"
-        c_path = client_dir / c_name
-        if not c_path.exists():
-            xml = _client_xml_skeleton(pascal, general_path, raml_cp)
-            try:
-                ET.fromstring(xml)
-            except ET.ParseError:
-                xml = f"<mule><flow name='api{pascal}-client-main'/></mule>"
-            c_path.write_text(xml, encoding="utf-8")
-            created.append(str(c_path.relative_to(root)))
-        # handler
-        h_name = f"api{pascal}-handler.xml"
-        h_path = handler_dir / h_name
-        if not h_path.exists():
-            xml = _handler_xml_skeleton(pascal)
-            try:
-                ET.fromstring(xml)
-            except ET.ParseError:
-                xml = f"<mule><flow name='api{pascal}-handler-main'/></mule>"
-            h_path.write_text(xml, encoding="utf-8")
-            created.append(str(h_path.relative_to(root)))
-    return created
-
-# ========= Rúbricas (aplican después del scaffold) =========
-
-def enforce_rubrics_on_tree(root: Path, raml_bytes: bytes|None) -> list[str]:
-    errors = []
-    ensure_dirs(root)
-
+def forbid_loose_xml(root: Path) -> list[str]:
     base = root / "src/main/mule"
-    client_dir = base / "client"
-    handler_dir = base / "handler"
-    orch_dir = base / "orchestrator"
-    common_dir = base / "common"
+    return [str(p) for p in base.glob("*.xml")]
 
-    loose = forbid_loose_xml(root)
-    if loose:
-        errors.append(f"XMLs sueltos en src/main/mule: {', '.join(loose)}")
-
-    resources = {}
-    if raml_bytes:
-        try:
-            raml_text = raml_bytes.decode("utf-8","ignore")
-            resources = parse_resources_from_raml(raml_text)
-        except Exception:
-            resources = {}
-    if not resources:
-        mf = list(base.rglob("*-mainFlow.xml"))
-        stem = "api"
-        if mf:
-            stem = mf[0].stem.replace("-mainFlow","")
-        resources = {stem: set()}
-
-    for recurso, actions in resources.items():
-        expected = canonical_names(recurso, actions)
-
-        existing_client = list(client_dir.glob("*.xml"))
-        if not existing_client:
-            errors.append(f"Falta archivo client para recurso {recurso}")
-        else:
-            rename_if_needed(existing_client[0], expected["client"])
-            if not re.match(r"^api[A-Z][A-Za-z0-9]*-client\.xml$", expected["client"]):
-                errors.append(f"Nombre inválido en client: {expected['client']}")
-
-        existing_handler = [p for p in handler_dir.glob("*.xml") if p.name != "common-error-handler.xml"]
-        if not existing_handler:
-            errors.append(f"Falta archivo handler para recurso {recurso}")
-        else:
-            rename_if_needed(existing_handler[0], expected["handler"])
-            if not re.match(r"^api[A-Z][A-Za-z0-9]*-handler\.xml$", expected["handler"]):
-                errors.append(f"Nombre inválido en handler: {expected['handler']}")
-
-        if not (handler_dir / "common-error-handler.xml").exists():
-            errors.append("Falta common-error-handler.xml en handler/")
-
-        existing_orch = list(orch_dir.glob("*.xml"))
-        if not existing_orch:
-            errors.append(f"Faltan orchestrators para recurso {recurso}")
-        else:
-            if not actions:
-                actions = {"retrieve"}
-            expected_orch = set(expected["orchestrators"])
-            for exp, cur in zip(sorted(expected_orch), existing_orch):
-                rename_if_needed(cur, exp)
-            bad = [p.name for p in orch_dir.glob("*.xml")
-                   if not re.match(r"^[a-z][A-Za-z0-9]*-(retrieve|evaluate|execute|init|create|update|delete)-orchestrator\.xml$", p.name)]
-            if bad:
-                errors.append(f"Nombres inválidos en orchestrator: {', '.join(bad)}")
-
-    for p in common_dir.glob("*.xml"):
-        try:
-            text = p.read_text(encoding="utf-8", errors="ignore")
-            if 'http:listener' in text:
-                errors.append("common/ no debe contener listeners HTTP")
-        except Exception:
-            pass
-
-    return errors
+def write_minimum_base_files(root: Path):
+    props = root / "src/main/resources/properties/application.properties"
+    if not props.exists():
+        props.write_text("http.port=8081\ngeneral.path=/api/*\n", encoding="utf-8")
+    maf = root / "mule-artifact.json"
+    if not maf.exists():
+        maf.write_text('{"minMuleVersion":"4.6.0","secureProperties":[]}\n', encoding="utf-8")
+    pom = root / "pom.xml"
+    if not pom.exists():
+        pom.write_text("""<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.company.experience</groupId>
+  <artifactId>mule-app</artifactId>
+  <version>1.0.0</version>
+  <packaging>mule-application</packaging>
+  <name>mule-app</name>
+</project>
+""", encoding="utf-8")
 
 def write_validate_script(root: Path):
     scripts = root / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
-    content = """#!/usr/bin/env bash
+    content = r"""#!/usr/bin/env bash
 set -euo pipefail
 
 # 1) Carpetas obligatorias
@@ -620,45 +499,235 @@ if find src/main/mule -maxdepth 1 -type f -name "*.xml" | grep -q .; then
   exit 1
 fi
 
-# 3) Nombres válidos por capa
-if find src/main/mule/client -type f -name "*.xml" | grep -Pv '^.*/api[A-Z][A-Za-z0-9]*-client\\.xml$' | grep -q .; then
-  echo "Nombre inválido en client (usar api<Recurso>-client.xml)"; exit 1
+# 3) Nombres por capa
+if find src/main/mule/client -type f -name "*.xml" | grep -Pv '^.*/[a-z][A-Za-z0-9]*-client\.xml$' | grep -q .; then
+  echo "Nombre inválido en client (<recurso>-client.xml)"; exit 1
+fi
+if find src/main/mule/handler -type f -name "*.xml" | grep -Pv '^.*/([a-z][A-Za-z0-9]*-handler|common-error-handler)\.xml$' | grep -q .; then
+  echo "Nombre inválido en handler (<recurso>-handler.xml o common-error-handler.xml)"; exit 1
+fi
+# orchestrator: acepta <recurso>-orchestrator.xml (1 operación) o <recurso>-<action>-orchestrator.xml (n>1)
+if find src/main/mule/orchestrator -type f -name "*.xml" | grep -Pv '^.*/([a-z][A-Za-z0-9]*-(get|post|put|delete|patch|head|options|retrieve|evaluate|execute|init|create|update|delete)-orchestrator|[a-z][A-Za-z0-9]*-orchestrator)\.xml$' | grep -q .; then
+  echo "Nombre inválido en orchestrator"; exit 1
 fi
 
-if find src/main/mule/handler -type f -name "*.xml" | grep -Pv '^.*/(api[A-Z][A-Za-z0-9]*-handler|common-error-handler)\\.xml$' | grep -q .; then
-  echo "Nombre inválido en handler (usar api<Recurso>-handler.xml o common-error-handler.xml)"; exit 1
-fi
-
-if find src/main/mule/orchestrator -type f -name "*.xml" | grep -Pv '^.*/[a-z][A-Za-z0-9]*-(retrieve|evaluate|execute|init|create|update|delete)-orchestrator\\.xml$' | grep -q .; then
-  echo "Nombre inválido en orchestrator (<recurso>-<action>-orchestrator.xml)"; exit 1
-fi
+# 4) Activos mínimos
+test -f "pom.xml" || { echo "Falta pom.xml"; exit 1; }
+test -f "mule-artifact.json" || { echo "Falta mule-artifact.json"; exit 1; }
+test -f "src/main/resources/properties/application.properties" || { echo "Falta application.properties"; exit 1; }
 
 echo "Validación de estructura OK ✅"
 """
     (scripts / "validate-structure.sh").write_text(content, encoding="utf-8")
     os.chmod(scripts / "validate-structure.sh", 0o755)
 
-def write_min_readme(root: Path, resources: dict):
+def write_min_readme(root: Path, raml_info: dict):
     readme = root / "README.md"
     lines = [
         "# Proyecto MuleSoft",
         "",
-        "## Recursos y correlación por capa",
+        "## Árbol de carpetas",
         "",
-        "| Recurso | Client | Handler | Orchestrators |",
-        "|---|---|---|---|",
+        "```\nsrc/main/mule/\n  client/\n  handler/\n  orchestrator/\n  common/\n```",
+        "",
+        "## Recursos y operaciones",
+        "",
+        "| Recurso | Operaciones | Headers requeridos (por método) |",
+        "|---|---|---|",
     ]
-    for r, actions in resources.items():
-        pascal = r[0].upper()+r[1:] if r else "Resource"
-        client = f"api{pascal}-client.xml"
-        handler = f"api{pascal}-handler.xml"
-        orchs = ", ".join(sorted([f"{r}-{a}-orchestrator.xml" for a in (actions or {'retrieve'})]))
-        lines.append(f"| {r} | {client} | {handler} | {orchs} |")
+    for r, d in sorted(raml_info.items()):
+        ops = ", ".join(sorted(d.get("methods", [])))
+        hdrs = {m: d.get("headers_required", {}).get(m, []) for m in d.get("methods", [])}
+        hdrs_str = "; ".join([f"{m}: {', '.join(v) if v else '-'}" for m, v in hdrs.items()]) if hdrs else "-"
+        lines.append(f"| {r} | {ops} | {hdrs_str} |")
+    lines += [
+        "",
+        "## Cómo ejecutar",
+        "- Configura `src/main/resources/properties/application.properties` (puerto y paths).",
+        "- Importa en Studio / empaqueta con Maven.",
+    ]
     readme.write_text("\n".join(lines)+"\n", encoding="utf-8")
 
-# ========= Parte 3: Proceso del arquetipo =========
+# ========= Helpers RAML/classpath =========
 
-TEXT_EXTS = {".xml",".json",".yaml",".yml",".raml",".properties",".txt",".pom",".md"}
+def first_raml_target(dst_root: Path) -> Path:
+    preferred = dst_root / "src/main/resources/api/api.raml"
+    if preferred.parent.exists():
+        return preferred
+    existing = list(dst_root.rglob("*.raml"))
+    return existing[0] if existing else preferred
+
+def raml_classpath(root: Path) -> str|None:
+    target = first_raml_target(root)
+    try:
+        rel = target.relative_to(root / "src/main/resources")
+        return "classpath:/" + "/".join(rel.parts)
+    except Exception:
+        candidates = list(root.rglob("*.raml"))
+        if candidates:
+            try:
+                rel = candidates[0].relative_to(root / "src/main/resources")
+                return "classpath:/" + "/".join(rel.parts)
+            except Exception:
+                return None
+    return None
+
+# ========= Refactor de archivos sueltos con LLM =========
+
+def transformar_archivo_con_gpt(fname: str, original: str, ctx: dict) -> str:
+    PROMPT_FILE = """Eres un configurador experto de proyectos Mule 4.
+Actualiza el archivo indicado usando METADATOS (YAML).
+
+Reglas:
+- Mantén formato/saltos.
+- No agregues explicaciones ni ``` .
+- Sigue comentarios guía; sustituye placeholders (groupId, artifactId, version, project.mule.name,
+  http listener path/port, http request host/protocol/path, exchange.json main/assetId/groupId/name/version,
+  y propiedades YAML app/general/upstream).
+- Si un valor del contexto es null, no lo inventes.
+- No borres secciones no relacionadas.
+
+=== METADATOS (YAML) ===
+{ctx_yaml}
+
+=== ARCHIVO ({fname}) ORIGINAL ===
+{original}
+"""
+    ctx_yaml = yaml.safe_dump(ctx, sort_keys=False, allow_unicode=True)
+    raw = _gpt([
+        {"role":"system","content":"Actúa como refactorizador determinista de archivos Mule/Java/XML/YAML/JSON."},
+        {"role":"user","content": PROMPT_FILE.format(ctx_yaml=ctx_yaml, fname=fname, original=original)}
+    ], temperature=0.1)
+
+    blocks = re.findall(r"```(?:xml|yaml|yml|json|properties|txt)?\s*(.*?)```", raw, re.DOTALL)
+    contenido = (blocks[-1].strip() if blocks else raw.strip())
+    if not contenido or len(contenido.splitlines()) < max(3, int(len(original.splitlines())*0.3)):
+        return original
+    return contenido
+
+# ========= POM: normalización determinista =========
+
+def _pom_qname(tag: str, ns: str|None):
+    return f"{{{ns}}}{tag}" if ns else tag
+
+def _pom_find_or_create(parent, tag, ns):
+    q = _pom_qname(tag, ns)
+    el = parent.find(q)
+    if el is None:
+        el = ET.SubElement(parent, q)
+    return el
+
+def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool) -> list[str]:
+    """Ajusta POM para packaging, mule-maven-plugin y apikit module si aplica."""
+    changes = []
+    pom_path = root_dir / "pom.xml"
+    if not pom_path.exists():
+        return changes
+
+    txt = pom_path.read_text(encoding="utf-8", errors="ignore")
+    try:
+        tree = ET.fromstring(txt)
+    except ET.ParseError:
+        # si está raro, no toco
+        return changes
+
+    # detectar namespace default (maven POM casi siempre lo usa)
+    if tree.tag.startswith("{"):
+        ns = tree.tag.split("}",1)[0][1:]
+    else:
+        ns = None
+
+    def q(tag): return _pom_qname(tag, ns)
+
+    # packaging
+    packaging = tree.find(q("packaging"))
+    if packaging is None or (packaging.text or "").strip().lower() != "mule-application":
+        if packaging is None:
+            packaging = ET.SubElement(tree, q("packaging"))
+        packaging.text = "mule-application"
+        changes.append("packaging=mule-application")
+
+    # name/artifactId (no sobreescribir si existen con valor)
+    artifactId = tree.find(q("artifactId"))
+    name = tree.find(q("name"))
+    desired_artifact = ctx.get("artifact_id") or "mule-app"
+    desired_name = ctx.get("project_name") or desired_artifact
+
+    if artifactId is None:
+        artifactId = ET.SubElement(tree, q("artifactId"))
+        artifactId.text = desired_artifact
+        changes.append(f"artifactId={desired_artifact}")
+    if name is None:
+        name = ET.SubElement(tree, q("name"))
+        name.text = desired_name
+        changes.append(f"name={desired_name}")
+
+    # build/plugins/mule-maven-plugin (con extensions true)
+    build = tree.find(q("build"))
+    if build is None:
+        build = ET.SubElement(tree, q("build"))
+    plugins = build.find(q("plugins"))
+    if plugins is None:
+        plugins = ET.SubElement(build, q("plugins"))
+
+    def has_mule_plugin():
+        for p in plugins.findall(q("plugin")):
+            gid = (p.find(q("groupId")).text if p.find(q("groupId")) is not None else "")
+            aid = (p.find(q("artifactId")).text if p.find(q("artifactId")) is not None else "")
+            if gid.strip()=="org.mule.tools.maven" and aid.strip()=="mule-maven-plugin":
+                return p
+        return None
+
+    mule_plugin = has_mule_plugin()
+    if mule_plugin is None:
+        mule_plugin = ET.SubElement(plugins, q("plugin"))
+        ET.SubElement(mule_plugin, q("groupId")).text = "org.mule.tools.maven"
+        ET.SubElement(mule_plugin, q("artifactId")).text = "mule-maven-plugin"
+        ET.SubElement(mule_plugin, q("version")).text = ctx.get("mule_maven_plugin_version","4.2.0")
+        ET.SubElement(mule_plugin, q("extensions")).text = "true"
+        changes.append("add: mule-maven-plugin")
+    else:
+        ext = mule_plugin.find(q("extensions"))
+        if ext is None or (ext.text or "").strip().lower() != "true":
+            if ext is None:
+                ext = ET.SubElement(mule_plugin, q("extensions"))
+            ext.text = "true"
+            changes.append("mule-maven-plugin.extensions=true")
+
+    # dependencies → apikit si hay RAML (APIkit activado)
+    if use_apikit:
+        deps = tree.find(q("dependencies"))
+        if deps is None:
+            deps = ET.SubElement(tree, q("dependencies"))
+
+        def has_apikit():
+            for d in deps.findall(q("dependency")):
+                gid = (d.find(q("groupId")).text if d.find(q("groupId")) is not None else "")
+                aid = (d.find(q("artifactId")).text if d.find(q("artifactId")) is not None else "")
+                if gid.strip()=="org.mule.modules" and aid.strip()=="mule-apikit-module":
+                    return d
+            return None
+
+        apikit_dep = has_apikit()
+        if apikit_dep is None:
+            dep = ET.SubElement(deps, q("dependency"))
+            ET.SubElement(dep, q("groupId")).text = "org.mule.modules"
+            ET.SubElement(dep, q("artifactId")).text = "mule-apikit-module"
+            ET.SubElement(dep, q("version")).text = ctx.get("apikit_version","1.11.0")
+            ET.SubElement(dep, q("classifier")).text = "mule-plugin"
+            changes.append("add: mule-apikit-module")
+
+    # guardar con pretty mínimo (ElementTree no indenta bonito, pero es válido)
+    try:
+        xml_bytes = ET.tostring(tree, encoding="utf-8")
+        pom_path.write_text(xml_bytes.decode("utf-8"), encoding="utf-8")
+    except Exception:
+        # fallback: no rompas nada si falla escritura
+        pass
+
+    return changes
+
+# ========= Proceso del arquetipo =========
 
 def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None):
     tmp_dir = Path(tempfile.mkdtemp())
@@ -670,7 +739,10 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     roots = [p for p in tmp_dir.iterdir() if p.is_dir()]
     root = roots[0] if len(roots)==1 else tmp_dir
 
-    # Progreso UI
+    ensure_dirs(root)
+    write_minimum_base_files(root)
+
+    # 1) Reescritura de archivos del arquetipo
     files_to_touch = []
     for r,_,fs in os.walk(root):
         for f in fs:
@@ -678,10 +750,11 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
             if p.suffix.lower() in (".png",".jpg",".jpeg",".gif",".webp",".svg",".pdf",".ppt",".pptx",".key",".ai",".psd"):
                 continue
             files_to_touch.append(p)
-    total = len(files_to_touch)
-    prog = st.progress(0.0)
 
+    prog = st.progress(0.0)
+    total = len(files_to_touch)
     modificados, errores = [], []
+
     for i, path in enumerate(files_to_touch, 1):
         prog.progress(i/total)
         try:
@@ -690,7 +763,7 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                 nuevo = transformar_archivo_con_gpt(path.name, original, ctx)
 
                 if path.suffix.lower() == ".xml":
-                    nuevo = postprocesar_xml(nuevo, path.name, ctx)
+                    nuevo = postprocesar_xml(nuevo, ctx)
 
                 ext = path.suffix.lower()
                 if path.name.lower()=="pom.xml" or ext==".xml":
@@ -706,53 +779,160 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
 
                 path.write_text(nuevo, encoding="utf-8")
                 if nuevo != original:
-                    modificados.append(str(path.relative_to(root)))
+                    try:
+                        modificados.append(str(path.relative_to(root)))
+                    except Exception:
+                        modificados.append(path.name)
         except Exception as e:
             errores.append(f"⚠️ Error en {path.name}: {e}")
 
-    # Inyectar RAML y parsear recursos
-    resources_for_readme = {}
+    # 2) Inyectar RAML y parsear info
+    raml_info = {}
     raml_cp_value = None
     if spec_bytes and st.session_state.uploaded_spec.name.lower().endswith(".raml"):
-        target = first_raml_target(root)  # prefer api.raml
+        target = first_raml_target(root)
         target.parent.mkdir(parents=True, exist_ok=True)
         with open(target, "wb") as f:
             f.write(spec_bytes)
-        modificados.append(str(target.relative_to(root)))
         try:
-            resources_for_readme = parse_resources_from_raml(spec_bytes.decode("utf-8","ignore"))
+            raml_text = spec_bytes.decode("utf-8","ignore")
+            raml_info = parse_raml_semilight(raml_text)
         except Exception:
-            resources_for_readme = {}
-        # classpath del RAML para apikit
+            raml_info = {}
         raml_cp_value = raml_classpath(root)
 
-    # === SCAFFOLD client/handler (+APIkit si hay RAML) y common-error-handler ===
-    if resources_for_readme:
-        created_ch = scaffold_client_handler(root, resources_for_readme, ctx.get("general_path"), raml_cp_value)
-        if created_ch:
-            modificados.extend(created_ch)
+    # 3) Scaffold según rúbricas
+    base = root / "src/main/mule"
+    client_dir = base / "client"
+    handler_dir = base / "handler"
+    orch_dir = base / "orchestrator"
+    common_dir = base / "common"
 
-    # === SCAFFOLD orchestrators (antes de rúbricas) ===
-    if resources_for_readme:
-        created_orch = scaffold_orchestrators(root, resources_for_readme)
-        if created_orch:
-            modificados.extend(created_orch)
-
-    # === RÚBRICAS (estructura y nombres) ===
-    rubric_errors = enforce_rubrics_on_tree(root, spec_bytes)
-
-    # Script de validación para CI/CD
-    write_validate_script(root)
-
-    # README opcional con tabla de correlación
-    if resources_for_readme:
+    # common-error-handler.xml
+    ceh = handler_dir / "common-error-handler.xml"
+    if not ceh.exists():
+        xml = common_error_handler_xml()
         try:
-            write_min_readme(root, resources_for_readme)
-        except Exception:
-            pass
+            ET.fromstring(xml)
+        except ET.ParseError:
+            xml = "<mule><sub-flow name='hdl_commonErrorHandler'/></mule>"
+        ceh.write_text(xml, encoding="utf-8")
+        modificados.append(str(ceh.relative_to(root)))
+
+    # global-config.xml (si no APIkit)
+    use_apikit = bool(raml_cp_value)
+    gc = common_dir / "global-config.xml"
+    if not gc.exists():
+        xml = common_global_config_xml(use_apikit)
+        try:
+            ET.fromstring(xml)
+        except ET.ParseError:
+            xml = "<mule/>"
+        gc.write_text(xml, encoding="utf-8")
+        modificados.append(str(gc.relative_to(root)))
+
+    if raml_info:
+        for recurso, data in sorted(raml_info.items()):
+            methods = data.get("methods") or {"retrieve"}
+
+            # client consolidado
+            c_path = client_dir / f"{recurso}-client.xml"
+            if not c_path.exists():
+                xml = client_file_xml(recurso, methods, ctx.get("general_path"), use_apikit, raml_cp_value)
+                try: ET.fromstring(xml)
+                except ET.ParseError: xml = f"<mule><flow name='{recurso}_client_main'/></mule>"
+                c_path.write_text(xml, encoding="utf-8")
+                modificados.append(str(c_path.relative_to(root)))
+
+            # handler consolidado
+            h_path = handler_dir / f"{recurso}-handler.xml"
+            if not h_path.exists():
+                xml = handler_file_xml(recurso, methods, raml_info)
+                try: ET.fromstring(xml)
+                except ET.ParseError: xml = f"<mule><flow name='{recurso}_handler_main'/></mule>"
+                h_path.write_text(xml, encoding="utf-8")
+                modificados.append(str(h_path.relative_to(root)))
+
+            # orchestrator: 1 ó varias operaciones
+            if len(methods) == 1:
+                o_path = orch_dir / f"{recurso}-orchestrator.xml"
+                if not o_path.exists():
+                    xml = orchestrator_file_xml(recurso, methods, raml_info, single_file=True)
+                    try: ET.fromstring(xml)
+                    except ET.ParseError: xml = f"<mule><flow name='{recurso}_orchestrator_{next(iter(methods))}'/></mule>"
+                    o_path.write_text(xml, encoding="utf-8")
+                    modificados.append(str(o_path.relative_to(root)))
+            else:
+                for m in sorted(methods):
+                    o_path = orch_dir / f"{recurso}-{m}-orchestrator.xml"
+                    if not o_path.exists():
+                        xml = orchestrator_file_xml(recurso, {m}, raml_info, single_file=False)
+                        try: ET.fromstring(xml)
+                        except ET.ParseError: xml = f"<mule><flow name='{recurso}_orchestrator_{m}'/></mule>"
+                        o_path.write_text(xml, encoding="utf-8")
+                        modificados.append(str(o_path.relative_to(root)))
+
+    # 3.5) Normalizar POM (packaging + mule-maven-plugin + apikit dependency si aplica)
+    pom_changes = enforce_pom_requirements(root, ctx, use_apikit)
+    if pom_changes:
+        modificados.append("pom.xml (ajustes: " + ", ".join(pom_changes) + ")")
+
+    # 4) Rúbricas BLOQUEANTES
+    rubric_errors = []
+
+    loose = forbid_loose_xml(root)
+    if loose:
+        rubric_errors.append("XMLs sueltos en src/main/mule: " + ", ".join(loose))
+    for d in ["client","handler","orchestrator","common"]:
+        if not (base / d).exists():
+            rubric_errors.append(f"Falta carpeta {d}/ bajo src/main/mule")
+    if not (root/"pom.xml").exists(): rubric_errors.append("Falta pom.xml")
+    if not (root/"mule-artifact.json").exists(): rubric_errors.append("Falta mule-artifact.json")
+    if not (root/"src/main/resources/properties/application.properties").exists(): rubric_errors.append("Falta application.properties")
+
+    bad_client = [p.name for p in (client_dir.glob("*.xml")) if not re.match(r"^[a-z][A-Za-z0-9]*-client\.xml$", p.name)]
+    if bad_client: rubric_errors.append("Nombres inválidos en client/: " + ", ".join(bad_client))
+    bad_handler = [p.name for p in (handler_dir.glob("*.xml")) if p.name!="common-error-handler.xml" and not re.match(r"^[a-z][A-Za-z0-9]*-handler\.xml$", p.name)]
+    if bad_handler: rubric_errors.append("Nombres inválidos en handler/: " + ", ".join(bad_handler))
+    bad_orch = [p.name for p in (orch_dir.glob("*.xml")) if not re.match(r"^([a-z][A-Za-z0-9]*-(get|post|put|delete|patch|head|options|retrieve|evaluate|execute|init|create|update|delete)-orchestrator|[a-z][A-Za-z0-9]*-orchestrator)\.xml$", p.name)]
+    if bad_orch: rubric_errors.append("Nombres inválidos en orchestrator/: " + ", ".join(bad_orch))
+
+    for p in client_dir.glob("*.xml"):
+        t = p.read_text("utf-8","ignore")
+        if "<flow-ref name=\"" not in t or "_handler_" not in t:
+            rubric_errors.append(f"{p.name}: client debe delegar a handler con flow-ref")
+        if "<http:request " in t:
+            rubric_errors.append(f"{p.name}: client no debe invocar http:request (externos)")
+    for p in handler_dir.glob("*.xml"):
+        if p.name == "common-error-handler.xml": continue
+        t = p.read_text("utf-8","ignore")
+        if "_orchestrator_" not in t:
+            rubric_errors.append(f"{p.name}: handler debe delegar a orchestrator con flow-ref")
+        if "<http:request " in t:
+            rubric_errors.append(f"{p.name}: handler no debe invocar http:request (externos)")
+
+    ceh_txt = (handler_dir / "common-error-handler.xml").read_text("utf-8","ignore") if (handler_dir / "common-error-handler.xml").exists() else ""
+    if "hdl_commonErrorHandler" not in ceh_txt:
+        rubric_errors.append("common-error-handler.xml debe contener sub-flow 'hdl_commonErrorHandler'")
+    for d in [client_dir, handler_dir, orch_dir]:
+        for p in d.glob("*.xml"):
+            t = p.read_text("utf-8","ignore")
+            if "<error-handler>" not in t:
+                rubric_errors.append(f"{p.name}: falta error-handler con flow-ref a hdl_commonErrorHandler")
+
+    # APIkit: sin listeners duplicados en common
+    if bool(raml_cp_value):
+        if "http:listener-config" in (common_dir/"global-config.xml").read_text("utf-8","ignore"):
+            rubric_errors.append("Con APIkit habilitado no debe haber listener-config en common/global-config.xml")
+
+    write_validate_script(root)
 
     if rubric_errors:
         raise RuntimeError("Rúbricas BLOQUEANTES:\n- " + "\n- ".join(rubric_errors))
+
+    if raml_info:
+        try: write_min_readme(root, raml_info)
+        except Exception: pass
 
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for p in root.rglob("*"):
@@ -786,13 +966,13 @@ def manejar_mensaje(user_input: str):
             st.session_state.uploaded_spec.seek(0)
             spec_bytes = st.session_state.uploaded_spec.read()
 
-        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo archivos del arquetipo con ChatGPT + scaffolds (client/APIkit/handler/orchestrators) + rúbricas..."})
+        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo arquetipo + generando scaffold (client/APIkit/handler/orchestrator) + normalizando POM + validando rúbricas..."})
         try:
             salida_zip, modificados, errores = procesar_arquetipo_llm(arquetipo, ctx, spec_bytes)
             st.session_state.generated_zip = salida_zip
             resumen = f"✅ Proyecto generado. Archivos modificados/creados: {len(modificados)}"
             if errores:
-                resumen += f"\n⚠️ Validaciones/Fallbacks: {len(errores)} (mostrando hasta 5):\n- " + "\n- ".join(errores[:5])
+                resumen += f"\n⚠️ Validaciones/Fallbacks: {len(errores)} (hasta 5):\n- " + "\n- ".join(errores[:5])
             st.session_state.messages.append({"role":"assistant","content":resumen})
         except Exception as e:
             st.session_state.messages.append({"role":"assistant","content":f"❌ Falló la generación: {e}"})
