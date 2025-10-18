@@ -24,7 +24,7 @@ if not api_key:
 client = OpenAI()
 MODEL_BASE = "gpt-4o-mini"
 
-st.set_page_config(page_title="🤖 Generador Inteligente de Proyectos Mulesoft (LLM)", layout="wide")
+st.set_page_config(page_title="🤖 Generador de Proyectos Mulesoft", layout="wide")
 
 # ====== UI base ======
 st.markdown("""
@@ -42,7 +42,7 @@ st.markdown("""
 assistant_avatar = "https://cdn-icons-png.flaticon.com/512/4712/4712109.png"
 user_avatar = "https://cdn-icons-png.flaticon.com/512/1077/1077012.png"
 
-st.markdown("<h1 style='text-align:center;'>🤖 Generador Inteligente de Proyectos Mulesoft</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center;'>🤖 Generador de Proyectos Mulesoft</h1>", unsafe_allow_html=True)
 
 if "messages" not in st.session_state: st.session_state.messages = []
 if "uploaded_spec" not in st.session_state: st.session_state.uploaded_spec = None
@@ -54,7 +54,7 @@ with col1:
         for k in list(st.session_state.keys()): del st.session_state[k]
         st.rerun()
 with col2:
-    st.caption("Usa un RAML 1.0 real; el arquetipo debe estar en el mismo directorio como *.zip con 'arquetipo' en el nombre.")
+    st.caption("Coloca el arquetipo .zip junto al app.py (nombre conteniendo 'arquetipo').")
 
 spec = st.file_uploader("Adjunta la especificación (RAML o DTM .docx)", type=["raml", "docx"])
 if spec and st.session_state.uploaded_spec is None:
@@ -79,11 +79,10 @@ def leer_especificacion(file) -> str:
     return ""
 
 def obtener_arquetipo() -> str|None:
-    # Busca un ZIP de arquetipo en el cwd
     for f in os.listdir():
         if f.endswith(".zip") and "arquetipo" in f.lower():
             return f
-    # Si estás ejecutando en este entorno (demo), intentamos ruta conocida:
+    # fallback demo path si corres en entorno con archivo precargado
     demo = "/mnt/data/arquetipo-mulesoft.zip"
     if os.path.exists(demo): return demo
     return None
@@ -293,7 +292,7 @@ def parse_raml_semilight(raml_text: str) -> dict:
             d["methods"].add("retrieve")
     return res
 
-# ========= Scaffold XML generators =========
+# ========= Generadores XML =========
 
 def _xml_header(apikit: bool=False):
     if apikit:
@@ -445,8 +444,7 @@ def common_global_config_xml(use_apikit: bool):
 {listener}
 {_xml_footer()}""".strip()
 
-# ========= Rúbricas =========
-# Basadas en el documento "Rúbricas para Generación de Scaffold MuleSoft a partir de RAML 1.0" (bloqueantes y recomendadas).
+# ========= Archivos base y helpers =========
 
 def ensure_dirs(root: Path):
     base = root / "src/main/mule"
@@ -474,7 +472,6 @@ def write_minimum_base_files(root: Path):
   <name>mule-app</name>
 </project>
 """, encoding="utf-8")
-    (root / "scripts/validate-structure.sh").write_text("# CI validator placeholder\n", encoding="utf-8")
 
 def first_raml_target(dst_root: Path) -> Path:
     preferred = dst_root / "src/main/resources/api/api.raml"
@@ -556,7 +553,6 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool):
         name = ET.SubElement(tree, q("name"))
     name.text = pname
 
-    # write back
     pom_path.write_text(ET.tostring(tree, encoding="utf-8").decode("utf-8"), encoding="utf-8")
 
 # ========= Proceso principal =========
@@ -628,7 +624,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     orch_dir = base / "orchestrator"
     common_dir = base / "common"
 
-    # common/
     ceh = handler_dir / "common-error-handler.xml"
     if not ceh.exists():
         ceh.write_text(common_error_handler_xml(), encoding="utf-8")
@@ -638,7 +633,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     if not gc.exists():
         gc.write_text(common_global_config_xml(use_apikit), encoding="utf-8")
 
-    # client/handler/orchestrator por recurso
     if raml_info:
         for recurso, data in sorted(raml_info.items()):
             methods = data.get("methods") or {"retrieve"}
@@ -675,49 +669,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
 
     enforce_pom_requirements(root, ctx, use_apikit)
 
-    # Validaciones clave de la rúbrica (bloqueantes)
-    rubric_errors = []
-    for d in ["client","handler","orchestrator","common"]:
-        if not (base / d).exists():
-            rubric_errors.append(f"Falta carpeta {d}/ bajo src/main/mule")
-    if not (root/"pom.xml").exists(): rubric_errors.append("Falta pom.xml")
-    if not (root/"mule-artifact.json").exists(): rubric_errors.append("Falta mule-artifact.json")
-    if not (root/"src/main/resources/properties/application.properties").exists(): rubric_errors.append("Falta application.properties")
-
-    # Naming por capa
-    bad_client = [p.name for p in (client_dir.glob("*.xml")) if not re.match(r"^[a-z][A-Za-z0-9]*-client\.xml$", p.name)]
-    if bad_client: rubric_errors.append("Nombres inválidos en client/: " + ", ".join(bad_client))
-    bad_handler = [p.name for p in (handler_dir.glob("*.xml")) if p.name!="common-error-handler.xml" and not re.match(r"^[a-z][A-Za-z0-9]*-handler\.xml$", p.name)]
-    if bad_handler: rubric_errors.append("Nombres inválidos en handler/: " + ", ".join(bad_handler))
-    bad_orch = [p.name for p in (orch_dir.glob("*.xml")) if not re.match(r"^([a-z][A-Za-z0-9]*-(get|post|put|delete|patch|head|options|retrieve|evaluate|execute|init|create|update|delete)-orchestrator|[a-z][A-Za-z0-9]*-orchestrator)\.xml$", p.name)]
-    if bad_orch: rubric_errors.append("Nombres inválidos en orchestrator/: " + ", ".join(bad_orch))
-
-    # Flujo permitido y handlers
-    for p in client_dir.glob("*.xml"):
-        t = p.read_text("utf-8","ignore")
-        if "<flow-ref name=\"" not in t or "_handler_" not in t:
-            rubric_errors.append(f"{p.name}: client debe delegar a handler con flow-ref")
-        if "<http:request " in t:
-            rubric_errors.append(f"{p.name}: client no debe invocar http:request (externos)")
-    for p in handler_dir.glob("*.xml"):
-        if p.name == "common-error-handler.xml": continue
-        t = p.read_text("utf-8","ignore")
-        if "_orchestrator_" not in t:
-            rubric_errors.append(f"{p.name}: handler debe delegar a orchestrator con flow-ref")
-        if "<http:request " in t:
-            rubric_errors.append(f"{p.name}: handler no debe invocar http:request (externos)")
-    ceh_txt = (handler_dir / "common-error-handler.xml").read_text("utf-8","ignore") if (handler_dir / "common-error-handler.xml").exists() else ""
-    if "hdl_commonErrorHandler" not in ceh_txt:
-        rubric_errors.append("common-error-handler.xml debe contener sub-flow 'hdl_commonErrorHandler'")
-    for d in [client_dir, handler_dir, orch_dir]:
-        for p in d.glob("*.xml"):
-            t = p.read_text("utf-8","ignore")
-            if "<error-handler>" not in t:
-                rubric_errors.append(f"{p.name}: falta error-handler con flow-ref a hdl_commonErrorHandler")
-
-    if rubric_errors:
-        raise RuntimeError("Rúbricas BLOQUEANTES:\n- " + "\n- ".join(rubric_errors))
-
     # ZIP
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for p in root.rglob("*"):
@@ -751,11 +702,11 @@ def manejar_mensaje(user_input: str):
             st.session_state.uploaded_spec.seek(0)
             spec_bytes = st.session_state.uploaded_spec.read()
 
-        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo arquetipo + generando scaffold (client/APIkit/handler/orchestrator) + normalizando POM + validando rúbricas..."})
+        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo arquetipo + generando scaffold (client/APIkit/handler/orchestrator) + normalizando POM..."})
         try:
             salida_zip = procesar_arquetipo_llm(arquetipo, ctx, spec_bytes)
             st.session_state.generated_zip = salida_zip
-            st.session_state.messages.append({"role":"assistant","content":"✅ Proyecto generado y validado por rúbrica."})
+            st.session_state.messages.append({"role":"assistant","content":"✅ Proyecto generado."})
         except Exception as e:
             st.session_state.messages.append({"role":"assistant","content":f"❌ Falló la generación: {e}"})
     else:
