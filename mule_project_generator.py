@@ -55,7 +55,7 @@ if st.button("🔄 Reiniciar"):
 spec = st.file_uploader("📎 Adjunta la especificación (RAML o DTM .docx)", type=["raml", "docx"])
 if spec and st.session_state.uploaded_spec is None:
     st.session_state.uploaded_spec = spec
-    st.session_state.messages.append({"role":"assistant","content":f"📄 Archivo `{spec.name}` cargado. Escribe `crea el proyecto`."})
+    st.session_state.messages.append({"role":"assistant","content":f"📄 Archivo \"{spec.name}\" cargado. Escribe \"crea el proyecto\"."})
 
 # ========= Utilidades =========
 
