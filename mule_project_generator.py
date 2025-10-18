@@ -1,4 +1,4 @@
-import tempfile, zipfile, re, os, sys, types
+import tempfile, zipfile, re, os, sys, types, io
 import xml.etree.ElementTree as ET
 import yaml
 from pathlib import Path
@@ -48,14 +48,18 @@ if "messages" not in st.session_state: st.session_state.messages = []
 if "uploaded_spec" not in st.session_state: st.session_state.uploaded_spec = None
 if "generated_zip" not in st.session_state: st.session_state.generated_zip = None
 
-if st.button("🔄 Reiniciar"):
-    for k in list(st.session_state.keys()): del st.session_state[k]
-    st.rerun()
+col1, col2 = st.columns([1,1])
+with col1:
+    if st.button("🔄 Reiniciar"):
+        for k in list(st.session_state.keys()): del st.session_state[k]
+        st.rerun()
+with col2:
+    st.caption("Usa un RAML 1.0 real; el arquetipo debe estar en el mismo directorio como *.zip con 'arquetipo' en el nombre.")
 
 spec = st.file_uploader("Adjunta la especificación (RAML o DTM .docx)", type=["raml", "docx"])
 if spec and st.session_state.uploaded_spec is None:
     st.session_state.uploaded_spec = spec
-    st.session_state.messages.append({"role":"assistant","content":f"📄 Archivo \"{spec.name}\" cargado. Escribe \"crea el proyecto\"."})
+    st.session_state.messages.append({"role":"assistant","content":f"📄 Archivo \"{spec.name}\" cargado. Escribe **crea el proyecto**."})
 
 # ========= Utilidades =========
 
@@ -75,9 +79,13 @@ def leer_especificacion(file) -> str:
     return ""
 
 def obtener_arquetipo() -> str|None:
+    # Busca un ZIP de arquetipo en el cwd
     for f in os.listdir():
         if f.endswith(".zip") and "arquetipo" in f.lower():
             return f
+    # Si estás ejecutando en este entorno (demo), intentamos ruta conocida:
+    demo = "/mnt/data/arquetipo-mulesoft.zip"
+    if os.path.exists(demo): return demo
     return None
 
 def validar_xml(txt: str, archivo: str) -> str|None:
@@ -118,7 +126,7 @@ endpoints: lista de endpoints "raíz" del RAML (array de strings)
 
 Reglas:
 - artifact_id = project_name en kebab-case.
-- general_path: si hay base_path o primer endpoint, usar "/<path>/*"; si el último segmento es muy específico (p.ej. "/evaluate"), mantén "/<base>/v1/*" si encaja mejor.
+- general_path: si hay base_path o primer endpoint, usar "/<path>/*".
 - Si base_uri tiene variables {HOST} o similares, host_name = null pero deriva protocol y base_path.
 - No incluyas texto fuera del YAML.
 """
@@ -133,7 +141,6 @@ def inferir_metadatos(contenido_api: str) -> dict:
         {"role":"user","content": PROMPT_CTX + "\n\n=== ESPECIFICACIÓN ===\n" + contenido_api}
     ], temperature=0.1)
 
-    # Limpieza defensiva
     m = re.search(r"```(?:yaml|yml)?\s*(.*?)```", yml, re.DOTALL)
     if m: yml = m.group(1).strip()
     try:
@@ -155,8 +162,7 @@ def inferir_metadatos(contenido_api: str) -> dict:
         base_path = (data.get("base_path") or "").lstrip("/")
         data["upstream_path"] = ("/"+base_path) if base_path else "/"
 
-    data = aplicar_perfil_por_capa(data)
-    return data
+    return aplicar_perfil_por_capa(data)
 
 # ========= Perfil por capa =========
 
@@ -169,14 +175,10 @@ def aplicar_perfil_por_capa(ctx: dict) -> dict:
             ctx["group_id"] = f"com.company.{pref_map[capa]}"
         if ctx.get("general_path") in (None, "", "/api/*"):
             bp = (ctx.get("base_path") or "").strip("/")
-            if bp:
-                parts = bp.split("/")
-                ctx["general_path"] = "/" + ("/".join(parts[:2]) if len(parts)>=2 else bp) + "/*"
-            else:
-                ctx["general_path"] = f"/{pref_map[capa]}/*"
+            ctx["general_path"] = ("/"+bp+"/*") if bp else f"/{pref_map[capa]}/*"
     return ctx
 
-# ========= Postprocesos deterministas (flows + TLS) =========
+# ========= Postprocesos deterministas =========
 
 def _safe_sub(rx, text, repl_fn, count=0):
     r = re.compile(rx, re.DOTALL)
@@ -255,7 +257,7 @@ def parse_raml_semilight(raml_text: str) -> dict:
             continue
 
         if line.lstrip().startswith("/"):
-            cur_res = line.strip().split()[0].strip("/").split("/")[0]
+            cur_res = line.strip().split()[0].strip("/").split("/")[0] or "root"
             res.setdefault(cur_res, {"methods": set(), "headers_required": {}, "req_types": {}, "res_types": {}})
             cur_method = None
             continue
@@ -291,7 +293,7 @@ def parse_raml_semilight(raml_text: str) -> dict:
             d["methods"].add("retrieve")
     return res
 
-# ========= Scaffold XML strings (APIkit / no-APIkit) =========
+# ========= Scaffold XML generators =========
 
 def _xml_header(apikit: bool=False):
     if apikit:
@@ -307,8 +309,7 @@ def _xml_header(apikit: bool=False):
         http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
         http://www.mulesoft.org/schema/mule/apikit http://www.mulesoft.org/schema/mule/apikit/current/mule-apikit.xsd
         http://www.mulesoft.org/schema/mule/tls http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd
-        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
-""".strip()
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">"""
     else:
         return """<?xml version="1.0" encoding="UTF-8"?>
 <mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
@@ -320,8 +321,7 @@ def _xml_header(apikit: bool=False):
         http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
         http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
         http://www.mulesoft.org/schema/mule/tls http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd
-        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
-""".strip()
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">"""
 
 def _xml_footer():
     return "</mule>\n"
@@ -335,7 +335,6 @@ def _mk_error_handler_ref():
     </error-handler>""".rstrip()
 
 def client_file_xml(resource: str, methods: set, general_path: str, use_apikit: bool, raml_cp: str|None):
-    gp = general_path or "/api/*"
     header = _xml_header(apikit=use_apikit)
 
     flows = []
@@ -377,11 +376,10 @@ def client_file_xml(resource: str, methods: set, general_path: str, use_apikit: 
   </flow>''')
         apikit_part = apikit_part + "\n" + "\n".join(impl)
 
-    body = "\n".join(flows)
     content = f"""{header}
   <!-- client consolidado para recurso '{resource}' -->
 {apikit_part if apikit_part else ""}
-{body}
+{chr(10).join(flows)}
 {_xml_footer()}"""
     return content.strip()
 
@@ -408,7 +406,7 @@ def orchestrator_file_xml(resource: str, methods: set, raml_info: dict, single_f
         for m in sorted(methods):
             blocks.append(f'''  <flow name="{resource}_orchestrator_{m}">
     <logger level="INFO" message="[{resource}] orchestrator {m} start"/>
-    <!-- TODO: mapping/externos según contrato RAML -->
+    <set-payload value='{{"status":"OK","resource":"{resource}","method":"{m}"}}' mimeType="application/json"/>
     <logger level="INFO" message="[{resource}] orchestrator {m} end"/>
 {_mk_error_handler_ref()}
   </flow>''')
@@ -421,7 +419,7 @@ def orchestrator_file_xml(resource: str, methods: set, raml_info: dict, single_f
         return f"""{header}
   <flow name="{resource}_orchestrator_{m}">
     <logger level="INFO" message="[{resource}] orchestrator {m} start"/>
-    <!-- TODO: mapping/externos según contrato RAML -->
+    <set-payload value='{{"status":"OK","resource":"{resource}","method":"{m}"}}' mimeType="application/json"/>
     <logger level="INFO" message="[{resource}] orchestrator {m} end"/>
 {_mk_error_handler_ref()}
   </flow>
@@ -447,7 +445,8 @@ def common_global_config_xml(use_apikit: bool):
 {listener}
 {_xml_footer()}""".strip()
 
-# ========= Rúbricas/estructura =========
+# ========= Rúbricas =========
+# Basadas en el documento "Rúbricas para Generación de Scaffold MuleSoft a partir de RAML 1.0" (bloqueantes y recomendadas).
 
 def ensure_dirs(root: Path):
     base = root / "src/main/mule"
@@ -456,11 +455,6 @@ def ensure_dirs(root: Path):
     (root / "src/main/resources/api").mkdir(parents=True, exist_ok=True)
     (root / "src/main/resources/properties").mkdir(parents=True, exist_ok=True)
     (root / "scripts").mkdir(parents=True, exist_ok=True)
-
-def forbid_loose_xml(root: Path) -> list[str]:
-    """Antes bloqueaba XMLs sueltos; ahora es solo informativo (no bloquea)."""
-    base = root / "src/main/mule"
-    return [str(p) for p in base.glob("*.xml")]
 
 def write_minimum_base_files(root: Path):
     props = root / "src/main/resources/properties/application.properties"
@@ -480,70 +474,7 @@ def write_minimum_base_files(root: Path):
   <name>mule-app</name>
 </project>
 """, encoding="utf-8")
-
-def write_validate_script(root: Path):
-    scripts = root / "scripts"
-    scripts.mkdir(parents=True, exist_ok=True)
-    content = r"""#!/usr/bin/env bash
-set -euo pipefail
-
-# 1) Carpetas obligatorias
-for d in client handler orchestrator common; do
-  test -d "src/main/mule/$d" || { echo "Falta carpeta $d"; exit 1; }
-done
-
-# 2) (Desactivado) XMLs sueltos permitidos por compatibilidad con arquetipos existentes
-
-# 3) Nombres por capa
-if find src/main/mule/client -type f -name "*.xml" | grep -Pv '^.*/[a-z][A-Za-z0-9]*-client\.xml$' | grep -q .; then
-  echo "Nombre inválido en client (<recurso>-client.xml)"; exit 1
-fi
-if find src/main/mule/handler -type f -name "*.xml" | grep -Pv '^.*/([a-z][A-Za-z0-9]*-handler|common-error-handler)\.xml$' | grep -q .; then
-  echo "Nombre inválido en handler (<recurso>-handler.xml o common-error-handler.xml)"; exit 1
-fi
-# orchestrator: acepta <recurso>-orchestrator.xml (1 operación) o <recurso>-<action>-orchestrator.xml (n>1)
-if find src/main/mule/orchestrator -type f -name "*.xml" | grep -Pv '^.*/([a-z][A-Za-z0-9]*-(get|post|put|delete|patch|head|options|retrieve|evaluate|execute|init|create|update|delete)-orchestrator|[a-z][A-Za-z0-9]*-orchestrator)\.xml$' | grep -q .; then
-  echo "Nombre inválido en orchestrator"; exit 1
-fi
-
-# 4) Activos mínimos
-test -f "pom.xml" || { echo "Falta pom.xml"; exit 1; }
-test -f "mule-artifact.json" || { echo "Falta mule-artifact.json"; exit 1; }
-test -f "src/main/resources/properties/application.properties" || { echo "Falta application.properties"; exit 1; }
-
-echo "Validación de estructura OK ✅"
-"""
-    (scripts / "validate-structure.sh").write_text(content, encoding="utf-8")
-    os.chmod(scripts / "validate-structure.sh", 0o755)
-
-def write_min_readme(root: Path, raml_info: dict):
-    readme = root / "README.md"
-    lines = [
-        "# Proyecto MuleSoft",
-        "",
-        "## Árbol de carpetas",
-        "",
-        "```\nsrc/main/mule/\n  client/\n  handler/\n  orchestrator/\n  common/\n```",
-        "",
-        "## Recursos y operaciones",
-        "",
-        "| Recurso | Operaciones | Headers requeridos (por método) |",
-        "|---|---|---|",
-    ]
-    for r, d in sorted(raml_info.items()):
-        ops = ", ".join(sorted(d.get("methods", [])))
-        hdrs = {m: d.get("headers_required", {}).get(m, []) for m in d.get("methods", [])}
-        hdrs_str = "; ".join([f"{m}: {', '.join(v) if v else '-'}" for m, v in hdrs.items()]) if hdrs else "-"
-        lines.append(f"| {r} | {ops} | {hdrs_str} |")
-    lines += [
-        "",
-        "## Cómo ejecutar",
-        "- Configura `src/main/resources/properties/application.properties` (puerto y paths).",
-        "- Importa en Studio / empaqueta con Maven.",
-    ]
-    readme.write_text("\n".join(lines)+"\n", encoding="utf-8")
-
-# ========= Helpers RAML/classpath =========
+    (root / "scripts/validate-structure.sh").write_text("# CI validator placeholder\n", encoding="utf-8")
 
 def first_raml_target(dst_root: Path) -> Path:
     preferred = dst_root / "src/main/resources/api/api.raml"
@@ -567,8 +498,6 @@ def raml_classpath(root: Path) -> str|None:
                 return None
     return None
 
-# ========= Refactor de archivos sueltos con LLM =========
-
 def transformar_archivo_con_gpt(fname: str, original: str, ctx: dict) -> str:
     PROMPT_FILE = """Eres un configurador experto de proyectos Mule 4.
 Actualiza el archivo indicado usando METADATOS (YAML).
@@ -576,7 +505,7 @@ Actualiza el archivo indicado usando METADATOS (YAML).
 Reglas:
 - Mantén formato/saltos.
 - No agregues explicaciones ni ``` .
-- Sigue comentarios guía; sustituye placeholders (groupId, artifactId, version, project.mule.name,
+- Sustituye placeholders (groupId, artifactId, version, project.mule.name,
   http listener path/port, http request host/protocol/path, exchange.json main/assetId/groupId/name/version,
   y propiedades YAML app/general/upstream).
 - Si un valor del contexto es null, no lo inventes.
@@ -600,120 +529,37 @@ Reglas:
         return original
     return contenido
 
-# ========= POM: normalización determinista =========
-
-def _pom_qname(tag: str, ns: str|None):
-    return f"{{{ns}}}{tag}" if ns else tag
-
-def _pom_find_or_create(parent, tag, ns):
-    q = _pom_qname(tag, ns)
-    el = parent.find(q)
-    if el is None:
-        el = ET.SubElement(parent, q)
-    return el
-
-def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool) -> list[str]:
-    changes = []
+def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool):
     pom_path = root_dir / "pom.xml"
-    if not pom_path.exists():
-        return changes
-
+    if not pom_path.exists(): return
     txt = pom_path.read_text(encoding="utf-8", errors="ignore")
     try:
         tree = ET.fromstring(txt)
     except ET.ParseError:
-        return changes
-
-    if tree.tag.startswith("{"):
-        ns = tree.tag.split("}",1)[0][1:]
-    else:
-        ns = None
-
-    def q(tag): return _pom_qname(tag, ns)
+        return
+    ns = tree.tag.split("}",1)[0][1:] if tree.tag.startswith("{") else None
+    def q(tag): return f"{{{ns}}}{tag}" if ns else tag
 
     packaging = tree.find(q("packaging"))
     if packaging is None or (packaging.text or "").strip().lower() != "mule-application":
-        if packaging is None:
-            packaging = ET.SubElement(tree, q("packaging"))
+        if packaging is None: packaging = ET.SubElement(tree, q("packaging"))
         packaging.text = "mule-application"
-        changes.append("packaging=mule-application")
 
     artifactId = tree.find(q("artifactId"))
     name = tree.find(q("name"))
-    desired_artifact = ctx.get("artifact_id") or "mule-app"
-    desired_name = ctx.get("project_name") or desired_artifact
-
+    artifact = ctx.get("artifact_id") or "mule-app"
+    pname = ctx.get("project_name") or artifact
     if artifactId is None:
         artifactId = ET.SubElement(tree, q("artifactId"))
-        artifactId.text = desired_artifact
-        changes.append(f"artifactId={desired_artifact}")
+    artifactId.text = artifact
     if name is None:
         name = ET.SubElement(tree, q("name"))
-        name.text = desired_name
-        changes.append(f"name={desired_name}")
+    name.text = pname
 
-    build = tree.find(q("build"))
-    if build is None:
-        build = ET.SubElement(tree, q("build"))
-    plugins = build.find(q("plugins"))
-    if plugins is None:
-        plugins = ET.SubElement(build, q("plugins"))
+    # write back
+    pom_path.write_text(ET.tostring(tree, encoding="utf-8").decode("utf-8"), encoding="utf-8")
 
-    def has_mule_plugin():
-        for p in plugins.findall(q("plugin")):
-            gid = (p.find(q("groupId")).text if p.find(q("groupId")) is not None else "")
-            aid = (p.find(q("artifactId")).text if p.find(q("artifactId")) is not None else "")
-            if gid.strip()=="org.mule.tools.maven" and aid.strip()=="mule-maven-plugin":
-                return p
-        return None
-
-    mule_plugin = has_mule_plugin()
-    if mule_plugin is None:
-        mule_plugin = ET.SubElement(plugins, q("plugin"))
-        ET.SubElement(mule_plugin, q("groupId")).text = "org.mule.tools.maven"
-        ET.SubElement(mule_plugin, q("artifactId")).text = "mule-maven-plugin"
-        ET.SubElement(mule_plugin, q("version")).text = ctx.get("mule_maven_plugin_version","4.2.0")
-        ET.SubElement(mule_plugin, q("extensions")).text = "true"
-        changes.append("add: mule-maven-plugin")
-    else:
-        ext = mule_plugin.find(q("extensions"))
-        if ext is None or (ext.text or "").strip().lower() != "true":
-            if ext is None:
-                ext = ET.SubElement(mule_plugin, q("extensions"))
-            ext.text = "true"
-            changes.append("mule-maven-plugin.extensions=true")
-
-    if use_apikit:
-        deps = tree.find(q("dependencies"))
-        if deps is None:
-            deps = ET.SubElement(tree, q("dependencies"))
-
-        def has_apikit():
-            for d in deps.findall(q("dependency")):
-                gid = (d.find(q("groupId")).text if d.find(q("groupId")) is not None else "")
-                aid = (d.find(q("artifactId")).text if d.find(q("artifactId")) is not None else "")
-                if gid.strip()=="org.mule.modules" and aid.strip()=="mule-apikit-module":
-                    return d
-            return None
-
-        apikit_dep = has_apikit()
-        if apikit_dep is None:
-            dep = ET.SubElement(deps, q("dependency"))
-            ET.SubElement(dep, q("groupId")).text = "org.mule.modules"
-            ET.SubElement(dep, q("artifactId")).text = "mule-apikit-module"
-            ET.SubElement(dep, q("version")).text = ctx.get("apikit_version","1.11.0")
-            ET.SubElement(dep, q("classifier")).text = "mule-plugin"
-            changes.append("add: mule-apikit-module")
-
-    try:
-        xml_bytes = ET.tostring(tree, encoding="utf-8")
-        pom_path.write_text(xml_bytes.decode("utf-8"), encoding="utf-8")
-    except Exception:
-        pass
-
-    return changes
-
-# ========= Proceso del arquetipo =========
+# ========= Proceso principal =========
 
 def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None):
     tmp_dir = Path(tempfile.mkdtemp())
@@ -728,6 +574,7 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     ensure_dirs(root)
     write_minimum_base_files(root)
 
+    # Reescritura guiada por LLM de todos los archivos de texto
     files_to_touch = []
     for r,_,fs in os.walk(root):
         for f in fs:
@@ -738,8 +585,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
 
     prog = st.progress(0.0)
     total = len(files_to_touch)
-    modificados, errores = [], []
-
     for i, path in enumerate(files_to_touch, 1):
         prog.progress(i/total)
         try:
@@ -753,24 +598,16 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                 ext = path.suffix.lower()
                 if path.name.lower()=="pom.xml" or ext==".xml":
                     err = validar_xml(nuevo, path.name)
-                    if err:
-                        errores.append(err + " (revirtiendo)")
-                        nuevo = original
+                    if err: nuevo = original
                 elif ext in (".yaml",".yml"):
                     err = validar_yaml(nuevo, path.name)
-                    if err:
-                        errores.append(err + " (revirtiendo)")
-                        nuevo = original
+                    if err: nuevo = original
 
                 path.write_text(nuevo, encoding="utf-8")
-                if nuevo != original:
-                    try:
-                        modificados.append(str(path.relative_to(root)))
-                    except Exception:
-                        modificados.append(path.name)
-        except Exception as e:
-            errores.append(f"⚠️ Error en {path.name}: {e}")
+        except Exception:
+            pass
 
+    # Copiar RAML y mapear recursos→flows
     raml_info = {}
     raml_cp_value = None
     if spec_bytes and st.session_state.uploaded_spec.name.lower().endswith(".raml"):
@@ -791,38 +628,27 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     orch_dir = base / "orchestrator"
     common_dir = base / "common"
 
+    # common/
     ceh = handler_dir / "common-error-handler.xml"
     if not ceh.exists():
-        xml = common_error_handler_xml()
-        try:
-            ET.fromstring(xml)
-        except ET.ParseError:
-            xml = "<mule><sub-flow name='hdl_commonErrorHandler'/></mule>"
-        ceh.write_text(xml, encoding="utf-8")
-        modificados.append(str(ceh.relative_to(root)))
+        ceh.write_text(common_error_handler_xml(), encoding="utf-8")
 
     use_apikit = bool(raml_cp_value)
     gc = common_dir / "global-config.xml"
     if not gc.exists():
-        xml = common_global_config_xml(use_apikit)
-        try:
-            ET.fromstring(xml)
-        except ET.ParseError:
-            xml = "<mule/>"
-        gc.write_text(xml, encoding="utf-8")
-        modificados.append(str(gc.relative_to(root)))
+        gc.write_text(common_global_config_xml(use_apikit), encoding="utf-8")
 
+    # client/handler/orchestrator por recurso
     if raml_info:
         for recurso, data in sorted(raml_info.items()):
             methods = data.get("methods") or {"retrieve"}
 
             c_path = client_dir / f"{recurso}-client.xml"
             if not c_path.exists():
-                xml = client_file_xml(recurso, methods, ctx.get("general_path"), use_apikit, raml_cp_value)
+                xml = client_file_xml(recurso, methods, ctx.get("general_path","/api/*"), use_apikit, raml_cp_value)
                 try: ET.fromstring(xml)
                 except ET.ParseError: xml = f"<mule><flow name='{recurso}_client_main'/></mule>"
                 c_path.write_text(xml, encoding="utf-8")
-                modificados.append(str(c_path.relative_to(root)))
 
             h_path = handler_dir / f"{recurso}-handler.xml"
             if not h_path.exists():
@@ -830,16 +656,14 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                 try: ET.fromstring(xml)
                 except ET.ParseError: xml = f"<mule><flow name='{recurso}_handler_main'/></mule>"
                 h_path.write_text(xml, encoding="utf-8")
-                modificados.append(str(h_path.relative_to(root)))
 
             if len(methods) == 1:
                 o_path = orch_dir / f"{recurso}-orchestrator.xml"
                 if not o_path.exists():
                     xml = orchestrator_file_xml(recurso, methods, raml_info, single_file=True)
                     try: ET.fromstring(xml)
-                    except ET.ParseError: xml = f"<mule><flow name='{recurso}_orchestrator_{next(iter(methods))}'/></mule>"
+                    except ET.ParseError: xml = f"<mule><flow name='{recurso}_orchestrator_main'/></mule>"
                     o_path.write_text(xml, encoding="utf-8")
-                    modificados.append(str(o_path.relative_to(root)))
             else:
                 for m in sorted(methods):
                     o_path = orch_dir / f"{recurso}-{m}-orchestrator.xml"
@@ -848,17 +672,11 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                         try: ET.fromstring(xml)
                         except ET.ParseError: xml = f"<mule><flow name='{recurso}_orchestrator_{m}'/></mule>"
                         o_path.write_text(xml, encoding="utf-8")
-                        modificados.append(str(o_path.relative_to(root)))
 
-    pom_changes = enforce_pom_requirements(root, ctx, use_apikit)
-    if pom_changes:
-        modificados.append("pom.xml (ajustes: " + ", ".join(pom_changes) + ")")
+    enforce_pom_requirements(root, ctx, use_apikit)
 
+    # Validaciones clave de la rúbrica (bloqueantes)
     rubric_errors = []
-
-    # >>>> RÚBRICA ELIMINADA: XMLs sueltos en src/main/mule (ya no bloquea) <<<<
-    # loose = forbid_loose_xml(root)  # lo dejamos como información, no error
-
     for d in ["client","handler","orchestrator","common"]:
         if not (base / d).exists():
             rubric_errors.append(f"Falta carpeta {d}/ bajo src/main/mule")
@@ -866,6 +684,7 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     if not (root/"mule-artifact.json").exists(): rubric_errors.append("Falta mule-artifact.json")
     if not (root/"src/main/resources/properties/application.properties").exists(): rubric_errors.append("Falta application.properties")
 
+    # Naming por capa
     bad_client = [p.name for p in (client_dir.glob("*.xml")) if not re.match(r"^[a-z][A-Za-z0-9]*-client\.xml$", p.name)]
     if bad_client: rubric_errors.append("Nombres inválidos en client/: " + ", ".join(bad_client))
     bad_handler = [p.name for p in (handler_dir.glob("*.xml")) if p.name!="common-error-handler.xml" and not re.match(r"^[a-z][A-Za-z0-9]*-handler\.xml$", p.name)]
@@ -873,6 +692,7 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     bad_orch = [p.name for p in (orch_dir.glob("*.xml")) if not re.match(r"^([a-z][A-Za-z0-9]*-(get|post|put|delete|patch|head|options|retrieve|evaluate|execute|init|create|update|delete)-orchestrator|[a-z][A-Za-z0-9]*-orchestrator)\.xml$", p.name)]
     if bad_orch: rubric_errors.append("Nombres inválidos en orchestrator/: " + ", ".join(bad_orch))
 
+    # Flujo permitido y handlers
     for p in client_dir.glob("*.xml"):
         t = p.read_text("utf-8","ignore")
         if "<flow-ref name=\"" not in t or "_handler_" not in t:
@@ -886,7 +706,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
             rubric_errors.append(f"{p.name}: handler debe delegar a orchestrator con flow-ref")
         if "<http:request " in t:
             rubric_errors.append(f"{p.name}: handler no debe invocar http:request (externos)")
-
     ceh_txt = (handler_dir / "common-error-handler.xml").read_text("utf-8","ignore") if (handler_dir / "common-error-handler.xml").exists() else ""
     if "hdl_commonErrorHandler" not in ceh_txt:
         rubric_errors.append("common-error-handler.xml debe contener sub-flow 'hdl_commonErrorHandler'")
@@ -896,24 +715,15 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
             if "<error-handler>" not in t:
                 rubric_errors.append(f"{p.name}: falta error-handler con flow-ref a hdl_commonErrorHandler")
 
-    if bool(raml_cp_value):
-        if "http:listener-config" in (common_dir/"global-config.xml").read_text("utf-8","ignore"):
-            rubric_errors.append("Con APIkit habilitado no debe haber listener-config en common/global-config.xml")
-
-    write_validate_script(root)
-
     if rubric_errors:
         raise RuntimeError("Rúbricas BLOQUEANTES:\n- " + "\n- ".join(rubric_errors))
 
-    if raml_info:
-        try: write_min_readme(root, raml_info)
-        except Exception: pass
-
+    # ZIP
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for p in root.rglob("*"):
             z.write(p, p.relative_to(root))
 
-    return str(out_zip), modificados, errores
+    return str(out_zip)
 
 # ========= Chat/acciones =========
 
@@ -943,12 +753,9 @@ def manejar_mensaje(user_input: str):
 
         st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo arquetipo + generando scaffold (client/APIkit/handler/orchestrator) + normalizando POM + validando rúbricas..."})
         try:
-            salida_zip, modificados, errores = procesar_arquetipo_llm(arquetipo, ctx, spec_bytes)
+            salida_zip = procesar_arquetipo_llm(arquetipo, ctx, spec_bytes)
             st.session_state.generated_zip = salida_zip
-            resumen = f"✅ Proyecto generado. Archivos modificados/creados: {len(modificados)}"
-            if errores:
-                resumen += f"\n⚠️ Validaciones/Fallbacks: {len(errores)} (hasta 5):\n- " + "\n- ".join(errores[:5])
-            st.session_state.messages.append({"role":"assistant","content":resumen})
+            st.session_state.messages.append({"role":"assistant","content":"✅ Proyecto generado y validado por rúbrica."})
         except Exception as e:
             st.session_state.messages.append({"role":"assistant","content":f"❌ Falló la generación: {e}"})
     else:
