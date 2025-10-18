@@ -24,7 +24,7 @@ if not api_key:
 client = OpenAI()
 MODEL_BASE = "gpt-4o-mini"
 
-st.set_page_config(page_title="🤖 Generador de Proyectos Mulesoft (rúbricas no bloqueantes)", layout="wide")
+st.set_page_config(page_title="🤖 Generador de Proyectos Mulesoft", layout="wide")
 
 # ====== UI base ======
 st.markdown("""
@@ -42,7 +42,7 @@ st.markdown("""
 assistant_avatar = "https://cdn-icons-png.flaticon.com/512/4712/4712109.png"
 user_avatar = "https://cdn-icons-png.flaticon.com/512/1077/1077012.png"
 
-st.markdown("<h1 style='text-align:center;'>🤖 Generador de Proyectos Mulesoft (Rúbricas → Warnings)</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center;'>🤖 Generador de Proyectos Mulesoft</h1>", unsafe_allow_html=True)
 
 if "messages" not in st.session_state: st.session_state.messages = []
 if "uploaded_spec" not in st.session_state: st.session_state.uploaded_spec = None
