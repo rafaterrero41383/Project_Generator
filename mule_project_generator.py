@@ -56,15 +56,6 @@ if "service_type" not in st.session_state: st.session_state.service_type = "UNKN
 if "spec_name" not in st.session_state: st.session_state.spec_name = None
 if "spec_kind" not in st.session_state: st.session_state.spec_kind = None   # "RAML" | "OAS" | "TEXT"
 
-col1, col2 = st.columns([1,1])
-with col1:
-    if st.button("🔄 Reiniciar"):
-        for k in list(st.session_state.keys()): del st.session_state[k]
-        st.rerun()
-with col2:
-    st.caption("")
-
-# ========= Visualización del tipo de API =========
 TYPE_LABELS = {
     "REC": "RECEPTION",
     "DOM": "DOMAIN",
@@ -73,10 +64,13 @@ TYPE_LABELS = {
     "UNKNOWN": "UNKNOWN"
 }
 
-def show_service_type_banner():
-    stype = st.session_state.get("service_type", "UNKNOWN")
-    label = TYPE_LABELS.get(stype, stype)
-    st.info(f"🔎 La API es de tipo **{label}**")
+col1, col2 = st.columns([1,1])
+with col1:
+    if st.button("🔄 Reiniciar"):
+        for k in list(st.session_state.keys()): del st.session_state[k]
+        st.rerun()
+with col2:
+    st.caption("")
 
 # ========= Utilidades =========
 
@@ -152,11 +146,8 @@ if spec and st.session_state.uploaded_spec is None:
     leer_especificacion(spec)  # solo para setear spec_kind
     st.session_state.messages.append({
         "role":"assistant",
-        "content":f"📄 Archivo \"{spec.name}\" cargado. Tipo detectado: **{TYPE_LABELS.get(st.session_state.service_type,'UNKNOWN')}**. Escribe **crea el proyecto**."
+        "content":f"📄 Archivo \"{spec.name}\" cargado. Escribe **crea el proyecto**."
     })
-
-# Mostrar banner de tipo
-show_service_type_banner()
 
 # ========= Helpers PROXY =========
 
@@ -632,8 +623,7 @@ def write_minimum_base_files(root: Path):
 """, encoding="utf-8")
 
 def first_raml_target(dst_root: Path) -> Path:
-    preferred = dst_root / "src/main/resources/api/api.raml"
-    return preferred
+    return dst_root / "src/main/resources/api/api.raml"
 
 def oas_target(dst_root: Path) -> Path:
     return dst_root / "src/main/resources/api/openapi.yaml"
@@ -722,7 +712,7 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool):
         ET.SubElement(p, q("version")).text = "4.2.0"
         ET.SubElement(p, q("extensions")).text = "true"
 
-    # APIkit si corresponde (solo con RAML)
+    # APIkit si corresponde (solo con RAML y si no es PROXY/REC)
     if use_apikit:
         deps = tree.find(q("dependencies")) or ET.SubElement(tree, q("dependencies"))
         found = False
@@ -992,7 +982,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
             with open(target, "wb") as f:
                 f.write(spec_bytes)
         elif spec_kind == "TEXT":
-            # DTM .docx => no hay nada que copiar (ya leído en texto)
             pass
 
     base = root / "src/main/mule"
@@ -1095,7 +1084,6 @@ def manejar_mensaje(user_input: str):
 
         st.session_state.messages.append({"role":"assistant","content":f"🧾 Metadatos:\n```yaml\n{yaml.safe_dump(ctx,sort_keys=False,allow_unicode=True)}\n```"})
 
-        spec_bytes = None
         st.session_state.uploaded_spec.seek(0)
         spec_bytes = st.session_state.uploaded_spec.read()
 
@@ -1110,6 +1098,10 @@ def manejar_mensaje(user_input: str):
             if st.session_state.observaciones:
                 resumen += f"\n⚠️ Observaciones (no bloqueantes): {len(st.session_state.observaciones)}"
             st.session_state.messages.append({"role":"assistant","content":resumen})
+
+            # Mostrar el tipo SOLO tras generar
+            st.info(f"🔎 La API es de tipo **{label}**")
+
         except Exception as e:
             st.session_state.messages.append({"role":"assistant","content":f"⚠️ Generación con advertencias: {e}"})
     else:
@@ -1126,9 +1118,6 @@ with st.container():
             unsafe_allow_html=True
         )
 
-# Banner siempre visible
-show_service_type_banner()
-
 # ====== Observaciones ======
 if st.session_state.get("observaciones"):
     st.markdown("### ⚠️ Observaciones de Rúbricas (no bloqueantes)")
@@ -1143,5 +1132,11 @@ if user_input:
 
 # ====== Descarga ======
 if st.session_state.generated_zip:
+    # Mostrar el tipo solo en esta fase
+    tipo = st.session_state.get("service_type","UNKNOWN")
+    st.info(f"🔎 La API es de tipo **{TYPE_LABELS.get(tipo, tipo)}**")
+
     with open(st.session_state.generated_zip, "rb") as f:
-        st.download_button("⬇️ Descargar Proyecto (.zip)", f, Path(st.session_state.generated_zip).name, "application/zip")
+        st.download_button("⬇️ Descargar Proyecto (.zip)", f,
+                           Path(st.session_state.generated_zip).name,
+                           "application/zip")
