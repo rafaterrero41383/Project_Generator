@@ -76,6 +76,17 @@ with col2:
 
 TEXT_EXTS = {".xml",".json",".yaml",".yml",".raml",".properties",".txt",".pom",".md"}
 
+INVALID_WIN = r'[:*?"<>|\\/]'  # caracteres inválidos para nombres de archivo en Windows
+
+def safe_filename(stx: str, fallback: str = "root") -> str:
+    """Sanitiza texto para usar como nombre de archivo/flow en Windows."""
+    s = (stx or "").strip()
+    if not s:
+        return fallback
+    s = re.sub(INVALID_WIN, "-", s)
+    s = s.strip("-._ ")
+    return s or fallback
+
 def _map_prefix_to_type(filename: str) -> str | None:
     m = re.match(r"^(Rec|DOM|Dom|BUS|Bus|PRO|Pro)_", filename or "")
     if not m: return None
@@ -143,7 +154,7 @@ if spec and st.session_state.uploaded_spec is None:
     st.session_state.service_type = stype if stype else "UNKNOWN"
 
     # Clasificar tipo de spec por extensión
-    leer_especificacion(spec)  # solo para setear spec_kind
+    leer_especificacion(spec)  # setea spec_kind
     st.session_state.messages.append({
         "role":"assistant",
         "content":f"📄 Archivo \"{spec.name}\" cargado. Escribe **crea el proyecto**."
@@ -152,7 +163,7 @@ if spec and st.session_state.uploaded_spec is None:
 # ========= Helpers PROXY =========
 
 def _parse_base_uri(uri: str):
-    if not uri: return ("http","localhost","8080","/")
+    if not uri: return ("http","localhost","8081","/")
     p = urllib.parse.urlparse(uri)
     protocol = p.scheme or "http"
     host = p.hostname or "localhost"
@@ -404,7 +415,8 @@ def parse_raml_semilight(raml_text: str) -> dict:
             continue
 
         if line.lstrip().startswith("/"):
-            cur_res = line.strip().split()[0].strip("/").split("/")[0] or "root"
+            seg = line.strip().split()[0].strip("/").split("/")[0]
+            cur_res = safe_filename(seg, "root")  # <-- sanitizado
             res.setdefault(cur_res, {"methods": set(), "headers_required": {}, "req_types": {}, "res_types": {}})
             cur_method = None
             continue
@@ -412,8 +424,8 @@ def parse_raml_semilight(raml_text: str) -> dict:
         token = line.strip().rstrip(":").lower()
         if token in HTTP_METHODS or token in EXTRA_ACTIONS:
             cur_method = token
-            res.setdefault(cur_res, {"methods": set(), "headers_required": {}, "req_types": {}, "res_types": {}})
-            res[cur_res]["methods"].add(cur_method)
+            res.setdefault(cur_res or "root", {"methods": set(), "headers_required": {}, "req_types": {}, "res_types": {}})
+            res[cur_res or "root"]["methods"].add(cur_method)
             continue
 
         if cur_method and line.strip().endswith(":") and "headers" in line.lower():
@@ -423,17 +435,17 @@ def parse_raml_semilight(raml_text: str) -> dict:
                     hdr = l2.rstrip(":")
                     block = "\n".join(lines[j: min(j+6, len(lines))]).lower()
                     if "required: true" in block:
-                        res[cur_res]["headers_required"].setdefault(cur_method, []).append(hdr)
+                        res[cur_res or "root"]["headers_required"].setdefault(cur_method, []).append(hdr)
 
         if cur_method and "body:" in line.lower():
             block = "\n".join(lines[i: min(i+10, len(lines))])
             m = re.search(r"type:\s*([A-Za-z0-9_\-\.]+)", block)
-            if m: res[cur_res]["req_types"][cur_method] = m.group(1)
+            if m: res[cur_res or "root"]["req_types"][cur_method] = m.group(1)
 
         if cur_method and "responses:" in line.lower():
             block = "\n".join(lines[i: min(i+15, len(lines))])
             m = re.search(r"200:\s*(?:\n|\r\n).*?type:\s*([A-Za-z0-9_\-\.]+)", block, re.DOTALL)
-            if m: res[cur_res]["res_types"][cur_method] = m.group(1)
+            if m: res[cur_res or "root"]["res_types"][cur_method] = m.group(1)
 
     for r, d in res.items():
         if not d["methods"]:
@@ -973,7 +985,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                 raml_info = parse_raml_semilight(raml_text)
             except Exception:
                 raml_info = {}
-            # APIkit solo si NO es PROXY ni REC/OAS
             if service_type not in ("PROXY","REC"):
                 raml_cp_value = raml_classpath(root)
         elif spec_kind == "OAS":
@@ -1011,34 +1022,36 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
             for recurso, data in sorted(raml_info.items()):
                 methods = data.get("methods") or {"retrieve"}
 
-                c_path = client_dir / f"{recurso}-client.xml"
+                rname = safe_filename(recurso, "root")  # <-- sanitizado para archivos y flow names
+
+                c_path = client_dir / f"{rname}-client.xml"
                 if not c_path.exists():
-                    xml = client_file_xml(recurso, methods, ctx.get("general_path","/api/*"), use_apikit, raml_cp_value)
+                    xml = client_file_xml(rname, methods, ctx.get("general_path","/api/*"), use_apikit, raml_cp_value)
                     try: ET.fromstring(xml)
-                    except ET.ParseError: xml = f"<mule><flow name='{recurso}_client_main'/></mule>"
+                    except ET.ParseError: xml = f"<mule><flow name='{rname}_client_main'/></mule>"
                     c_path.write_text(xml, encoding="utf-8")
 
-                h_path = handler_dir / f"{recurso}-handler.xml"
+                h_path = handler_dir / f"{rname}-handler.xml"
                 if not h_path.exists():
-                    xml = handler_file_xml(recurso, methods, raml_info)
+                    xml = handler_file_xml(rname, methods, raml_info)
                     try: ET.fromstring(xml)
-                    except ET.ParseError: xml = f"<mule><flow name='{recurso}_handler_main'/></mule>"
+                    except ET.ParseError: xml = f"<mule><flow name='{rname}_handler_main'/></mule>"
                     h_path.write_text(xml, encoding="utf-8")
 
                 if len(methods) == 1:
-                    o_path = orch_dir / f"{recurso}-orchestrator.xml"
+                    o_path = orch_dir / f"{rname}-orchestrator.xml"
                     if not o_path.exists():
-                        xml = orchestrator_file_xml(recurso, methods, raml_info, single_file=True)
+                        xml = orchestrator_file_xml(rname, methods, raml_info, single_file=True)
                         try: ET.fromstring(xml)
-                        except ET.ParseError: xml = f"<mule><flow name='{recurso}_orchestrator_main'/></mule>"
+                        except ET.ParseError: xml = f"<mule><flow name='{rname}_orchestrator_main'/></mule>"
                         o_path.write_text(xml, encoding="utf-8")
                 else:
                     for m in sorted(methods):
-                        o_path = orch_dir / f"{recurso}-{m}-orchestrator.xml"
+                        o_path = orch_dir / f"{rname}-{m}-orchestrator.xml"
                         if not o_path.exists():
-                            xml = orchestrator_file_xml(recurso, {m}, raml_info, single_file=False)
+                            xml = orchestrator_file_xml(rname, {m}, raml_info, single_file=False)
                             try: ET.fromstring(xml)
-                            except ET.ParseError: xml = f"<mule><flow name='{recurso}_orchestrator_{m}'/></mule>"
+                            except ET.ParseError: xml = f"<mule><flow name='{rname}_orchestrator_{m}'/></mule>"
                             o_path.write_text(xml, encoding="utf-8")
 
     # POM y dependencias mínimas
