@@ -55,7 +55,7 @@ with col1:
         for k in list(st.session_state.keys()): del st.session_state[k]
         st.rerun()
 with col2:
-    st.caption("Coloca el arquetipo .zip junto al app.py (nombre conteniendo 'arquetipo').")
+    st.caption("")
 
 spec = st.file_uploader("Adjunta la especificación (RAML o DTM .docx)", type=["raml", "docx"])
 if spec and st.session_state.uploaded_spec is None:
