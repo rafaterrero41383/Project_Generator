@@ -63,7 +63,7 @@ TYPE_LABELS = {
     "DOM": "DOMAIN",
     "BUS": "BUSINESS RULES",
     "PROXY": "PROXY",
-    "UNKNOWN": "UNKNOWN"
+    "-": "-"
 }
 
 col1, col2 = st.columns([1,1])
@@ -1158,11 +1158,27 @@ if st.session_state.get("observaciones"):
     st.markdown("### ⚠️ Observaciones de Rúbricas (no bloqueantes)")
     st.markdown("\n".join(f"- {o}" for o in st.session_state.observaciones))
 
-# === Si hay generación pendiente, ejecutarla y NO mostrar input habilitado ===
+# === Si hay generación pendiente, ejecutarla y NO mostrar input ===
 if st.session_state.is_generating and st.session_state.pending_action == "generate":
     with st.spinner("Generando proyecto..."):
         ejecutar_generacion()
     st.rerun()
+
+# ====== Entrada chat (oculta durante la generación) ======
+if st.session_state.get("is_generating", False):
+    # No mostramos st.chat_input en absoluto para impedir escritura/envío
+    st.markdown(
+        "<div style='opacity:0.7; padding:10px; border:1px dashed #bbb; border-radius:10px;'>"
+        "⏳ <b>Generando proyecto…</b> El chat está temporalmente deshabilitado."
+        "</div>",
+        unsafe_allow_html=True
+    )
+else:
+    user_input = st.chat_input("Escribe aquí...")
+    if user_input:
+        st.session_state.messages.append({"role":"user","content":user_input})
+        manejar_mensaje(user_input)
+        st.rerun()
 
 # ====== Entrada chat ======
 chat_disabled = st.session_state.get("is_generating", False)
