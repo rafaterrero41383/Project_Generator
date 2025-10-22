@@ -1,0 +1,19 @@
+{
+  "extends": [
+    "./node_modules/@umvel/javascript-base-guidelines/.eslintrc.json"
+  ],
+  "env": {
+    "node": true,
+    "es6": true,
+    "jest": true,
+    "mocha": true
+  },
+  "rules": {
+    "node/no-unpublished-require": ["error", {
+      "allowModules": ["chai", "sinon"]
+    }]
+  },
+  "globals": {
+    "httpClient": "readonly"
+  }
+}

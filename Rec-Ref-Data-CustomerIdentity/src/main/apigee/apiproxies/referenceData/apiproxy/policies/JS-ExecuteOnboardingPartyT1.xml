@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<Javascript
+  async="false"
+  continueOnError="false"
+  enabled="true"
+  name="JS-ExecuteOnboardingPartyT1"
+  timeLimit="200"
+>
+  <DisplayName>JS-ExecuteOnboardingPartyT1</DisplayName>
+  <Properties />
+  <ResourceURL>jsc://executeOnboardingPartyT1.js</ResourceURL>
+</Javascript>

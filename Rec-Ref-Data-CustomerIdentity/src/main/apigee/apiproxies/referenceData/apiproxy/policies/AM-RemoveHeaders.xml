@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<AssignMessage async="false" continueOnError="false" enabled="true" name="AM-RemoveHeaders">
+  <DisplayName>AM-RemoveHeaders</DisplayName>
+  <Properties/>
+  <Remove>
+    <Headers/>
+  </Remove>
+  <Set>
+    <Headers>
+      <Header name="Content-Type">application/json; charset=utf-8</Header>
+    </Headers>
+  </Set>
+  <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</AssignMessage>

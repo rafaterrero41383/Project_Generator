@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit" xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xsi:schemaLocation="
+		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools  http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+	<munit:config name="get-healthcheck-test-suite.xml" />
+	<munit:test name="get-healthcheck-test-suite-get-healthcheckSub_FlowTest" doc:id="1e8e0918-0e95-4bac-a02f-c04d9e480c53" description="Test">
+		<munit:execution >
+			<flow-ref doc:name="Flow-ref to get-healthcheckSub_Flow" doc:id="04f19305-e9d1-429b-bb82-dc4c3db099b7" name="get-healthcheckSub_Flow"/>
+		</munit:execution>
+		<munit:validation >
+			<munit-tools:assert doc:name="Assert expression" doc:id="fea9ff4e-16bd-45d6-beae-25c431fe1964" />
+		</munit:validation>
+	</munit:test>
+	<!-- [STUDIO:"get-healthcheck-test-suite-get-healthcheckSub_FlowTest1"]<munit:test name="get-healthcheck-test-suite-get-healthcheckSub_FlowTest1" doc:id="6d56cf68-7299-4d09-a673-dfad98c1f9e3" description="Test">
+		<munit:behavior >
+			<munit-tools:mock-when doc:name="Mock when Try healtcheck" doc:id="9cf5c3ce-0d11-4544-80f2-6d36301f8e59" processor="flow-ref">
+				<munit-tools:with-attributes >
+					<munit-tools:with-attribute whereValue="6c92dc1a-dfd3-468f-82bc-b7ff2cd69157" attributeName="doc:id" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return >
+					<munit-tools:error typeId="HTTP:CONNECTIVITY" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution >
+			<flow-ref doc:name="Flow-ref to get-healthcheckSub_Flow" doc:id="870d1516-a8a9-4013-992c-98c69aec9c81" name="get-healthcheckSub_Flow"/>
+		</munit:execution>
+		<munit:validation >
+			<munit-tools:assert doc:name="Assert expression" doc:id="dc17076e-36f0-4c09-afd1-0a057b71a01b" />
+		</munit:validation>
+	</munit:test> [STUDIO] -->
+
+
+</mule>

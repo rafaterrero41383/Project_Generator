@@ -1,0 +1,11 @@
+{
+    "maven.terminal.favorites": [
+        {
+            "command": "gatling:test -Dgatling.simulationClass=simulations.StressTest",
+            "debug": false
+        }
+    ],
+    "files.watcherExclude": {
+        "**/target": true
+    }
+}

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<OASValidation continueOnError="false" enabled="true" name="OAS-Request">
+  <DisplayName>OAS-Request</DisplayName>
+  <Properties/>
+  <Source>request</Source>
+  <Options>
+    <ValidateMessageBody>true</ValidateMessageBody>
+  </Options>
+  <OASResource>oas://rec-reference-data.json</OASResource>
+</OASValidation>

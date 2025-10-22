@@ -1,0 +1,8 @@
+{
+  "proxies": [
+    {
+      "name": "referenceData"
+    }
+  ],
+  "sharedflows": []
+}

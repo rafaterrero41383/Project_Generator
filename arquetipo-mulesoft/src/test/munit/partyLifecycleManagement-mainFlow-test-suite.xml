@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit" xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xsi:schemaLocation="
+		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools  http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+	<munit:config name="partyLifecycleManagement-mainFlow-test-suite.xml" />
+	<munit:test name="partyLifecycleManagement-mainFlow-test-suite-get:\starwars\characters:starwars-configTest" doc:id="067053af-42b1-420b-a0de-53f69b7eec11" description="Test">
+		<munit:execution >
+			<flow-ref doc:name="Flow-ref to get:\starwars\characters:starwars-config" doc:id="44e2e100-0377-4d38-88e9-ca9b5c8b5572" name="get:\starwars\characters:starwars-config"/>
+		</munit:execution>
+		<munit:validation >
+			<munit-tools:assert doc:name="Assert expression" doc:id="b4ac31c1-26a9-4a33-9c49-4fc1bf15b31a" />
+		</munit:validation>
+	</munit:test>
+	<munit:test name="partyLifecycleManagement-mainFlow-test-suite-starwars-mainTest" doc:id="ef743de5-5517-4fb8-8bc4-44196d15abcf" description="Test">
+		<munit:behavior >
+			<munit-tools:mock-when doc:name="Mock when APIkit Router" doc:id="e0d3fa8d-21fb-4315-94cb-3354ef0060b8" processor="apikit:router">
+				<munit-tools:with-attributes >
+					<munit-tools:with-attribute whereValue="starwars-config" attributeName="config-ref" />
+				</munit-tools:with-attributes>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution >
+			<flow-ref doc:name="Flow-ref to starwars-main" doc:id="0b96344e-1a10-4756-99a1-b15ca40bd2d6" name="starwars-main"/>
+		</munit:execution>
+		<munit:validation >
+			<munit-tools:assert doc:name="Assert expression" doc:id="c56fc6f7-356b-4ed6-9cc3-7e6d2f5dde0c" />
+		</munit:validation>
+	</munit:test>
+	<munit:test name="partyLifecycleManagement-mainFlow-test-suite-starwars-consoleTest" doc:id="eb0a24a3-30b4-481e-9541-007ac60e928b" description="Test">
+		<munit:behavior >
+			<munit-tools:mock-when doc:name="Mock when APIkit Console" doc:id="aa3c014d-a0fe-48c6-8f8e-63f9fa39ea46" processor="apikit:console">
+				<munit-tools:with-attributes >
+					<munit-tools:with-attribute whereValue="starwars-config" attributeName="config-ref" />
+				</munit-tools:with-attributes>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution >
+			<flow-ref doc:name="Flow-ref to starwars-console" doc:id="a4b2bb21-2973-4f65-a817-3b4d82055225" name="starwars-console"/>
+		</munit:execution>
+		<munit:validation >
+			<munit-tools:assert doc:name="Assert expression" doc:id="1a8dc791-767e-4736-810c-3b0632f866dc" />
+		</munit:validation>
+	</munit:test>
+	<munit:test name="partyLifecycleManagement-mainFlow-test-suite-starwars-consoleTest1" doc:id="e6d37cd3-1cd6-4de4-998c-c103b7dd0b20" description="Test" expectedErrorType="ANY">
+		<munit:behavior >
+			<munit-tools:mock-when doc:name="Mock when APIkit Console" doc:id="f1bd79ae-8552-4e79-a02f-02f9b538eb14" processor="apikit:console" >
+				<munit-tools:with-attributes >
+					<munit-tools:with-attribute whereValue="starwars-config" attributeName="config-ref" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return >
+					<munit-tools:error typeId="HTTP:INTERNAL_SERVER_ERROR" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution >
+			<flow-ref doc:name="Flow-ref to starwars-console" doc:id="474d2ad3-7cd2-46f0-81bf-f86de0d6ce2e" name="starwars-console"/>
+		</munit:execution>
+		<munit:validation >
+			<munit-tools:assert doc:name="Assert expression" doc:id="440275fd-adea-42b7-928c-721ce68ef3a3" />
+		</munit:validation>
+	</munit:test>
+	<munit:test name="partyLifecycleManagement-mainFlow-test-suite-get:\healthcheck:starwars-configTest" doc:id="7c6aee6e-1302-4d32-8671-aebfb34d7ee4" description="Test">
+		<munit:execution >
+			<flow-ref doc:name="Flow-ref to get:\healthcheck:starwars-config" doc:id="d7f530d7-935c-45a8-a195-c3b7e7306bf1" name="get:\healthcheck:starwars-config"/>
+		</munit:execution>
+		<munit:validation >
+			<munit-tools:assert doc:name="Assert expression" doc:id="f7d6502a-849b-42eb-9023-761d958a33a5" />
+		</munit:validation>
+	</munit:test>
+
+
+</mule>

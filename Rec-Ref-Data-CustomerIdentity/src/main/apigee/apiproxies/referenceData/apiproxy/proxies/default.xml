@@ -1,0 +1,260 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ProxyEndpoint name="default">
+  <Description>Rec customers</Description>
+  <HTTPProxyConnection>
+    <BasePath>/experience/referenceData</BasePath>
+  </HTTPProxyConnection>
+  <PreFlow name="PreFlow">
+    <Request/>
+    <Response/>
+  </PreFlow>
+  <Flows>
+    <Flow name="V1CustomerLocationReferenceRegister_POST">
+      <Description>Operacion que permite el manejo del proceso de guardado de la direccion del cliente.</Description>
+      <Request>
+        <Step>
+          <Name>FC-TokenTransfer</Name>
+        </Step>
+        <Step>
+          <Name>FC-VerifyToken</Name>
+        </Step>
+        <Step>
+          <Name>FC-Decrypt</Name>
+        </Step>
+        <Step>
+          <Name>JS-EvaluateSchema</Name>
+        </Step>
+        <Step>
+          <Condition>(schemaEvaluate.valid = "false")</Condition>
+          <Name>RF-RequireProperties</Name>
+        </Step>
+        <Step>
+          <Name>OAS-Request</Name>
+        </Step>
+        <Step>
+          <Name>JS-CreateNewLocation</Name>
+        </Step>
+      </Request>
+      <Condition>(proxy.pathsuffix MatchesPath "/v1/customerLocationReference/register") AND (request.verb = "POST")</Condition>
+      <Response/>
+    </Flow>
+    <Flow name="RecRetrieveOCRDocument">
+      <Description>Servicio de experiencia que se encarga de retornar datos sobre la lectura del usuario de la declaración de identificación y dirección envuelta en el objeto ocrData.</Description>
+      <Condition>(proxy.pathsuffix MatchesPath "/v1/ocrDocument/retrieve") AND (request.verb = "GET")</Condition>
+      <Request>
+        <Step>
+          <Name>FC-SpikeArrestApolo</Name>
+        </Step>
+        <Step>
+          <Name>FC-DataDog-Unity</Name>
+        </Step>
+        <Step>
+          <Name>FC-TokenTransfer</Name>
+        </Step>
+        <Step>
+          <Name>FC-VerifyToken</Name>
+        </Step>
+        <Step>
+          <Name>FC-Decrypt</Name>
+        </Step>
+        <Step>
+          <Name>OAS-Request</Name>
+        </Step>
+        <Step>
+          <Name>AM-RecRetrieveOCRDocumentT1</Name>
+        </Step>
+      </Request>
+      <Response/>
+    </Flow>
+    <Flow name="V1OnBoardingPartySuitabilityEvaluate_POST">
+      <Description>Servicio de experiencia que se encarga de consultar al cliente en las listas negras respectivas</Description>
+      <Condition>proxy.pathsuffix MatchesPath "/v1/onBoardingPartySuitability/evaluate" AND request.verb = "POST"</Condition>
+      <Request>
+        <Step>
+          <Name>FC-SpikeArrestApolo</Name>
+        </Step>
+        <Step>
+          <Name>FC-DataDog-Unity</Name>
+        </Step>
+        <Step>
+          <Name>FC-TokenTransfer</Name>
+        </Step>
+        <Step>
+          <Name>FC-VerifyToken</Name>
+        </Step>
+        <Step>
+          <Name>FC-Decrypt</Name>
+        </Step>
+        <Step>
+          <Name>OAS-Request</Name>
+        </Step>
+        <Step>
+          <Name>AM-RecEvaluateOnBoardingPartySuitabilityT1</Name>
+        </Step>
+      </Request>
+      <Response/>
+    </Flow>
+    <Flow name="V1CustomerRetrieve_POST">
+      <Description>Realiza la consulta del cliente por diferentes parámetros.</Description>
+      <Condition>proxy.pathsuffix MatchesPath "/v1/customer/retrieve" AND request.verb = "POST"</Condition>
+      <Request>
+        <Step>
+          <Name>FC-WhiteListSiweb</Name>
+        </Step>
+        <Step>
+          <Name>FC-DataDog-Unity</Name>
+        </Step>
+        <Step>
+          <Name>FC-TokenTransfer</Name>
+        </Step>
+        <Step>
+          <Name>FC-VerifyToken</Name>
+        </Step>
+        <Step>
+          <Name>FC-Decrypt</Name>
+        </Step>
+        <Step>
+          <Name>JS-CleanRequestT1</Name>
+        </Step>
+        <Step>
+          <Name>OAS-Request</Name>
+        </Step>
+      </Request>
+      <Response/>
+    </Flow>
+    <Flow name="V1RetrievePaymentBalancesRetrieve_POST">
+      <Description>Obtener los totales de pagos referenciados, pagos de WU/OV/VG para que se consultan las transacciones de abono a cuenta.</Description>
+      <Condition>proxy.pathsuffix MatchesPath "/v1/retrievePaymentBalances/retrieve" AND request.verb = "POST"</Condition>
+      <Request>
+        <Step>
+          <Name>OAS-Request</Name>
+        </Step>
+        <Step>
+          <Name>JS-RetrievePaymentBalancesFacilityT1</Name>
+        </Step>
+      </Request>
+      <Response/>
+    </Flow>
+    <Flow name="V1CustomerCardRetrieve_POST">
+      <Description>En este microservicio se realiza la consulta de datos (nombre(s), apellido(s), RFC y número de tarjeta) del cliente titular de una tarjeta de crédito de las tablas sd_maecred, sd_tarjeta y si_cliente. Estas consultas se realizan para consultar los datos del cliente titular.</Description>
+      <Condition>proxy.pathsuffix MatchesPath "/v1/customerCard/retrieve" AND request.verb = "POST"</Condition>
+      <Request>
+        <Step>
+          <Name>OAS-Request</Name>
+        </Step>
+        <Step>
+          <Name>JS-RetrieveCustomerCardT1</Name>
+        </Step>
+      </Request>
+      <Response/>
+    </Flow>
+    <Flow name="Rec_incomeProfileInitiate">
+      <Description>Servicio de recepción para el registro de la fuente de ingresos y tipo de residencia del cliente en el proceso de Alta de un Cliente Nuevo (Alta Única)</Description>
+      <Request>
+        <Step>
+          <Name>FC-TokenTransfer</Name>
+        </Step>
+        <Step>
+          <Name>FC-VerifyToken</Name>
+        </Step>
+        <Step>
+          <Name>FC-Decrypt</Name>
+        </Step>
+        <Step>
+          <Name>JS-CleanRequestT1</Name>
+        </Step>
+        <Step>
+          <Name>OAS-Request</Name>
+        </Step>
+      </Request>
+      <Response/>
+      <Condition>(proxy.pathsuffix MatchesPath "/v1/incomeProfile/initiate") AND (request.verb = "POST")</Condition>
+    </Flow>
+    <Flow name="RecCustomerRelationshipInvolvementInitiate">
+      <Description>Servicio encargado de realizar el registro de las referencias proporcionadas por el cliente solicitante del crédito en el proceso de la captura de los parámetros del cliente para la evaluación de la solicitud.</Description>
+      <Request>
+        <Step>
+          <Name>OAS-Request</Name>
+        </Step>
+        <Step>
+          <Name>AM-RecInitiateCustomerRelationshipInvolvementT1</Name>
+        </Step>
+      </Request>
+      <Response/>
+      <Condition>(proxy.pathsuffix MatchesPath "/v1/customerRelationshipInvolvement/initiate") and (request.verb = "POST")</Condition>
+    </Flow>
+    <Flow name="V1OnboardingPartyExecute_PUT">
+      <Description>Servicio de experiencia encargado de guardar el prospecto y pasarlo a cliente</Description>
+      <Condition>proxy.pathsuffix MatchesPath "/v1/onBoardingParty/execute" AND request.verb = "PUT"</Condition>
+      <Request>
+        <Step>
+          <Name>FC-SpikeArrestApolo</Name>
+        </Step>
+        <Step>
+          <Name>FC-DataDog-Unity</Name>
+        </Step>
+        <Step>
+          <Name>FC-TokenTransfer</Name>
+        </Step>
+        <Step>
+          <Name>FC-VerifyToken</Name>
+        </Step>
+        <Step>
+          <Name>FC-Decrypt</Name>
+        </Step>
+        <Step>
+          <Name>OAS-Request</Name>
+        </Step>
+        <Step>
+          <Name>JS-ExecuteOnboardingPartyT1</Name>
+        </Step>
+      </Request>
+      <Response/>
+    </Flow>
+    <Flow name="Rec_RetriveCustomerIdentity POST">
+      <Description>API de recepción encargado de validar el CURP mediante la integración con el servicio proporcionado por RENAPO (Incode) dom_retrieveRenapo. Con la finalidad de asegurar la veracidad de la información proporcionada por el usuario (datos personales) y realizando un guardado de la información en Yugabite (Dom_CaptureRenapo). En el proceso de onboarding.</Description>
+      <Condition>proxy.pathsuffix MatchesPath "/v1/customerIdentity/retrieve" AND request.verb = "POST"</Condition>
+      <Request>
+        <Step>
+          <Name>FC-TokenTransfer</Name>
+        </Step>
+        <Step>
+          <Name>FC-VerifyToken</Name>
+        </Step>
+        <Step>
+          <Name>FC-Decrypt</Name>
+        </Step>
+        <Step>
+          <Name>OAS-Request</Name>
+        </Step>
+        <Step>
+          <Name>AM-RecRetriveCustomerIdentityT1</Name>
+        </Step>
+      </Request>
+      <Response/>
+    </Flow>
+    <Flow name="NotFoundOperation">
+      <Description>Not Found Operation</Description>
+      <Request>
+        <Step>
+          <Name>RF-NotFoundOperation</Name>
+        </Step>
+      </Request>
+    </Flow>
+  </Flows>
+  <PostFlow name="PostFlow">
+    <Request/>
+    <Response/>
+  </PostFlow>
+  <FaultRules/>
+  <DefaultFaultRule name="default-fault">
+    <Step>
+      <Name>FC-ErrorHandler-Unity</Name>
+    </Step>
+  </DefaultFaultRule>
+  <RouteRule name="backend">
+    <Condition>(RouteRule != "NoRule")</Condition>
+    <TargetEndpoint>backend</TargetEndpoint>
+  </RouteRule>
+  <RouteRule name="NoRoute"/>
+</ProxyEndpoint>
