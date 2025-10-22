@@ -1,9 +1,13 @@
-import tempfile, zipfile, re, os, sys, types, io, json, textwrap
+import tempfile, zipfile, re, os, sys, types
 import xml.etree.ElementTree as ET
 import yaml
 from pathlib import Path
-
-from h11._abnf import method
+import hashlib, shutil, time
+import json
+import socket
+import datetime
+import urllib.parse
+import requests  # Para enviar logs a Datadog
 
 # --- Parche compatibilidad 3.13 ---
 if 'imghdr' not in sys.modules:
@@ -15,7 +19,6 @@ from docx import Document
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
-import urllib.parse
 
 # ========= CONFIG =========
 load_dotenv()
@@ -24,10 +27,18 @@ if not api_key:
     st.error("❌ Falta OPENAI_API_KEY en secretos/entorno.")
     st.stop()
 
+# Datadog (env)
+DD_API_KEY = os.getenv("DATADOG_API_KEY")
+DD_SITE = os.getenv("DATADOG_SITE", "datadoghq.com").strip() or "datadoghq.com"
+DD_URL = f"https://http-intake.logs.{DD_SITE}/api/v2/logs"
+DD_SERVICE = os.getenv("DATADOG_SERVICE", "mule-project-generator")
+DD_SOURCE = os.getenv("DATADOG_SOURCE", "mulesoft-gen")
+DD_TAGS = os.getenv("DATADOG_TAGS", "app:mule-gen,env:local")  # formato "k:v,k:v"
+
 client = OpenAI()
 MODEL_BASE = "gpt-4o-mini"
 
-st.set_page_config(page_title="🤖 Generador de Proyectos Mulesoft", layout="wide")
+st.set_page_config(page_title="🤖 Generador de Proyectos", layout="wide")
 
 # ====== UI base ======
 st.markdown("""
@@ -39,6 +50,9 @@ st.markdown("""
 .message-bubble { padding: 12px 14px; border-radius: 14px; max-width: 85%; line-height:1.38; }
 .user-bubble { background:#e3f2fd; border:1px solid #bbdefb; }
 .assistant-bubble { background:#f1f0f0; border:1px solid #ddd; }
+.sev-CRIT { color:#b71c1c; }
+.sev-WARN { color:#e65100; }
+.sev-INFO { color:#1565c0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -55,8 +69,13 @@ if "observaciones" not in st.session_state: st.session_state.observaciones = []
 if "service_type" not in st.session_state: st.session_state.service_type = "UNKNOWN"
 if "spec_name" not in st.session_state: st.session_state.spec_name = None
 if "spec_kind" not in st.session_state: st.session_state.spec_kind = None   # "RAML" | "OAS" | "TEXT"
-if "raml_text" not in st.session_state: st.session_state.raml_text = None  # para evaluación de rúbricas
-if "rubrics_result" not in st.session_state: st.session_state.rubrics_result = None
+# === Flags para bloquear el chat mientras se genera ===
+if "is_generating" not in st.session_state: st.session_state.is_generating = False
+if "pending_action" not in st.session_state: st.session_state.pending_action = None
+# === Selector de arquetipo ===
+if "archetype_choice" not in st.session_state: st.session_state.archetype_choice = "Automático"
+# === Rúbricas (siempre cargadas desde raíz) ===
+if "rubrics_defs" not in st.session_state: st.session_state.rubrics_defs = []
 
 TYPE_LABELS = {
     "REC": "RECEPTION",
@@ -77,8 +96,7 @@ with col2:
 # ========= Utilidades =========
 
 TEXT_EXTS = {".xml",".json",".yaml",".yml",".raml",".properties",".txt",".pom",".md"}
-
-INVALID_WIN = r'[:*?"<>|\\/]'  # caracteres inválidos para nombres de archivo en Windows
+INVALID_WIN = r'[:*?"<>|\\/]'
 
 def safe_filename(stx: str, fallback: str = "root") -> str:
     s = (stx or "").strip()
@@ -99,14 +117,11 @@ def _map_prefix_to_type(filename: str) -> str | None:
     return None
 
 def leer_especificacion(file) -> str:
-    """Lee RAML, OAS (yaml/json) o DTM .docx como texto para el prompt de metadatos."""
     name = file.name.lower()
     file.seek(0)
     if name.endswith(".raml"):
         st.session_state.spec_kind = "RAML"
-        txt = file.read().decode("utf-8", errors="ignore")
-        st.session_state.raml_text = txt
-        return txt
+        return file.read().decode("utf-8", errors="ignore")
     if name.endswith((".yaml",".yml",".json")):
         st.session_state.spec_kind = "OAS"
         return file.read().decode("utf-8", errors="ignore")
@@ -120,14 +135,7 @@ def leer_especificacion(file) -> str:
     st.session_state.spec_kind = None
     return ""
 
-def obtener_arquetipo() -> str|None:
-    for f in os.listdir():
-        if f.endswith(".zip") and "arquetipo" in f.lower():
-            return f
-    demo = "/mnt/data/arquetipo-mulesoft.zip"
-    if os.path.exists(demo): return demo
-    return None
-
+# ✅ Validadores
 def validar_xml(txt: str, archivo: str) -> str|None:
     try:
         ET.fromstring(txt)
@@ -142,26 +150,57 @@ def validar_yaml(txt: str, archivo: str) -> str|None:
     except yaml.YAMLError as e:
         return f"⚠️ {archivo}: Error YAML → {e}"
 
-# ========= Upload =========
+# === Arquetipos: genérico y Reception ===
 
-spec = st.file_uploader(
-    "Adjunta la especificación (RAML, OAS .yaml/.json o DTM .docx)",
-    type=["raml","yaml","yml","json","docx"]
-)
-if spec and st.session_state.uploaded_spec is None:
-    st.session_state.uploaded_spec = spec
-    st.session_state.spec_name = spec.name
+def _file_sha256(path: str, chunk=1024*1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b: break
+            h.update(b)
+    return h.hexdigest()
 
-    # Detección SOLO por prefijo de archivo
-    stype = _map_prefix_to_type(spec.name)
-    st.session_state.service_type = stype if stype else "UNKNOWN"
+def obtener_arquetipo_generic() -> str | None:
+    for f in os.listdir():
+        p = Path(f)
+        if p.is_dir() and "arquetipo" in p.name.lower():
+            return str(p.resolve())
+    for f in os.listdir():
+        if f.endswith(".zip") and "arquetipo" in f.lower():
+            return str(Path(f).resolve())
+    demo = "/mnt/data/arquetipo-mulesoft.zip"
+    if os.path.exists(demo):
+        return demo
+    return None
 
-    # Clasificar tipo de spec por extensión
-    leer_especificacion(spec)  # setea spec_kind y raml_text
-    st.session_state.messages.append({
-        "role":"assistant",
-        "content":f"📄 Archivo \"{spec.name}\" cargado. Escribe **crea el proyecto**."
-    })
+def obtener_arquetipo_reception() -> str | None:
+    for f in os.listdir():
+        p = Path(f)
+        if p.is_dir() and re.search(r"rec[-_].*customeridentity", p.name.lower()):
+            return str(p.resolve())
+    for f in os.listdir():
+        if f.lower().endswith(".zip") and re.search(r"rec[-_].*customeridentity", f.lower()):
+            return str(Path(f).resolve())
+    return None
+
+def preparar_arquetipo_trabajo(arquetipo_path: str) -> Path:
+    p = Path(arquetipo_path)
+    if p.is_dir():
+        return p
+    cache_root = Path.home() / ".mule_archetypes"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    digest = _file_sha256(str(p))
+    target = cache_root / digest
+    marker = target / ".ready"
+    if not marker.exists():
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        target.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(str(p), "r") as z:
+            z.extractall(target)
+        marker.write_text(f"{int(time.time())}\n", encoding="utf-8")
+    return target
 
 # ========= Helpers PROXY =========
 
@@ -202,7 +241,7 @@ def _patch_env_properties(root: Path, protocol: str, host: str, port: str, base_
 
 def _gen_proxy_flows(dst_mule_dir: Path, artifact_id: str):
     dst_mule_dir.mkdir(parents=True, exist_ok=True)
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
 <mule xmlns="http://www.mulesoft.org/schema/mule/core"
       xmlns:http="http://www.mulesoft.org/schema/mule/http"
       xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
@@ -212,16 +251,16 @@ def _gen_proxy_flows(dst_mule_dir: Path, artifact_id: str):
         http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
         http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
 
-  <http:listener-config name="{artifact_id}-http">
+  <http:listener-config name="{ARTIFACT}-http">
     <http:listener-connection host="0.0.0.0" port="8081"/>
   </http:listener-config>
 
-  <http:request-config name="{artifact_id}-upstream">
+  <http:request-config name="{ARTIFACT}-upstream">
     <http:request-connection protocol="#[p('proxy.protocol')]" host="#[p('proxy.host')]" port="#[p('proxy.port')]"/>
   </http:request-config>
 
-  <flow name="{artifact_id}-proxy-flow">
-    <http:listener config-ref="{artifact_id}-http" path="/{{+proxyPath}}">
+  <flow name="{ARTIFACT}-proxy-flow">
+    <http:listener config-ref="{ARTIFACT}-http" path="/{{+proxyPath}}">
       <http:response statusCode="#[attributes.statusCode default 200]"/>
     </http:listener>
 
@@ -235,19 +274,19 @@ payload
 
         <ee:set-attributes><![CDATA[%dw 2.0
 output application/java
-var qp = (attributes.queryParams default {{}}) as Object
+var qp = (attributes.queryParams default {}) as Object
 ---
 {
   method: (attributes.method default "GET") as String,
   targetPath: (p("proxy.basePath") as String) ++ "/" ++ (attributes."listenerPathParams".proxyPath as String),
   queryParams: qp,
-  headers: (attributes.headers default {{}}) as Object
+  headers: (attributes.headers default {}) as Object
 }]]></ee:set-attributes>
       </ee:message>
     </ee:transform>
 
     <http:request method="#[attributes.method]"
-                  config-ref="{artifact_id}-upstream"
+                  config-ref="{ARTIFACT}-upstream"
                   path="#[attributes.targetPath]"
                   queryParams="#[attributes.queryParams]"
                   headers="#[attributes.headers]">
@@ -264,6 +303,7 @@ var qp = (attributes.queryParams default {{}}) as Object
   </error-handler>
 </mule>
 """
+    xml = xml.replace("{ARTIFACT}", artifact_id)
     (dst_mule_dir / f"{artifact_id}-proxy.xml").write_text(xml, encoding="utf-8")
 
 # ========= LLM metadatos =========
@@ -362,10 +402,8 @@ def renombrar_flows_con_prefijo(xml_text: str, ctx: dict) -> str:
     return xml_text
 
 def insertar_o_actualizar_tls(xml_text: str, ctx: dict) -> str:
-    if not ctx.get("tls_enabled"):
-        return xml_text
-    if "xmlns:tls=" not in xml_text:
-        return xml_text
+    if not ctx.get("tls_enabled"): return xml_text
+    if "xmlns:tls=" not in xml_text: return xml_text
 
     has_ctx = "<tls:context" in xml_text
     tls_ctx = ['<tls:context name="default-tls">']
@@ -385,8 +423,7 @@ def insertar_o_actualizar_tls(xml_text: str, ctx: dict) -> str:
     def add_tls_ref(_rx: str):
         def repl(m):
             tag = m.group(0)
-            if 'tlsContext-ref=' in tag:
-                return tag
+            if 'tlsContext-ref=' in tag: return tag
             return tag[:-1] + ' tlsContext-ref="default-tls"'
         return repl
 
@@ -401,7 +438,7 @@ def postprocesar_xml(xml_text: str, ctx: dict) -> str:
     xml_text = insertar_o_actualizar_tls(xml_text, ctx)
     return xml_text
 
-# ========= Parsing RAML (semilight) =========
+# ========= Parsing RAML (para scaffold si hay RAML) =========
 
 HTTP_METHODS = {"get","post","put","delete","patch","head","options"}
 EXTRA_ACTIONS = {"retrieve","evaluate","execute","init","create","update","delete"}
@@ -587,63 +624,24 @@ def orchestrator_file_xml(resource: str, methods: set, raml_info: dict, single_f
   </flow>
 {_xml_footer()}""".strip()
 
-def common_error_handler_xml_detailed():
-    # Cumple rúbrica handler-error.xml / mapeo 4xx/5xx
+def common_error_handler_xml():
     header = _xml_header(False)
     return f"""{header}
-  <!-- common error handler con mapeo de status -->
-  <sub-flow name="hdl_commonErrorHandler">
-    <set-variable variableName="httpStatus" value="#[(error.errorType.namespace default '') as String match {{
-      case 'HTTP' -> (error.errorType.identifier default '500') as Number
-      else -> 500
-    }}]"/>
-    <set-variable variableName="outboundHeaders" value="#[{{ 'Content-Type': 'application/json' }}]"/>
-    <set-payload value='{{"status":"ERROR","message":"#[error.description default error.message]"}}' mimeType="application/json"/>
-  </sub-flow>
-{_xml_footer()}""".strip()
-
-def validation_headers_xml():
-    header = _xml_header(False)
-    return f"""{header}
-  <!-- Validador de headers obligatorios (plantilla) -->
-  <sub-flow name="common_validate_headers">
-    <choice>
-      <when expression="#[isEmpty(attributes.headers.'consumerRequestId')]">
-        <raise-error type="HTTP:BAD_REQUEST" description="Missing consumerRequestId"/>
-      </when>
-      <otherwise/>
-    </choice>
-  </sub-flow>
-{_xml_footer()}""".strip()
-
-def global_logging_observability_xml():
-    header = _xml_header(False)
-    return f"""{header}
-  <!-- Convención de logging y hooks de métricas -->
-  <sub-flow name="common_log_inbound">
-    <logger level="INFO" message='{{"event":"inbound","reqId":"#[attributes.headers."consumerRequestId"]","path":"#[attributes.requestPath]","method":"#[attributes.method]"}}'/>
-  </sub-flow>
-
-  <sub-flow name="common_log_outbound">
-    <logger level="INFO" message='{{"event":"outbound","status":"#[attributes.statusCode default 200]"}}'/>
-  </sub-flow>
-{_xml_footer()}""".strip()
-
-def healthcheck_xml():
-    header = _xml_header(False)
-    return f"""{header}
-  <flow name="common_healthcheck">
-    <set-payload value='{{"status":"UP"}}' mimeType="application/json"/>
-  </flow>
-{_xml_footer()}""".strip()
-
-def common_error_handler_xml_min():
-    header = _xml_header(False)
-    return f"""{header}
-  <!-- common error handler mínimo -->
+  <!-- common error handler -->
   <sub-flow name="hdl_commonErrorHandler">
     <logger level="ERROR" message="type=#[error.errorType] desc=#[error.description]"/>
   </sub-flow>
+{_xml_footer()}""".strip()
+
+def common_global_config_xml(use_apikit: bool):
+    header = _xml_header(False)
+    listener = "" if use_apikit else """
+  <http:listener-config name="global-httpListener">
+    <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+  </http:listener-config>""".rstrip()
+    return f"""{header}
+  <configuration-properties file="properties/application.properties"/>
+{listener}
 {_xml_footer()}""".strip()
 
 # ========= Archivos base y helpers =========
@@ -656,27 +654,14 @@ def ensure_dirs(root: Path):
     (root / "src/main/resources/properties").mkdir(parents=True, exist_ok=True)
     (root / "scripts").mkdir(parents=True, exist_ok=True)
     (root / "src/test/munit").mkdir(parents=True, exist_ok=True)
-    (root / "exchange-docs").mkdir(parents=True, exist_ok=True)
 
 def write_minimum_base_files(root: Path):
-    props_dir = root / "src/main/resources/properties"
     props = root / "src/main/resources/properties/application.properties"
     if not props.exists():
         props.write_text("http.port=8081\ngeneral.path=/api/*\n", encoding="utf-8")
-
-    # Env properties (cumple rúbrica 23)
-    for env in ("dev","qa","prod"):
-        f = props_dir / f"{env}-config.yaml"
-        if not f.exists():
-            f.write_text(
-                "upstream:\n  protocol: https\n  host: backend.example.com\n  port: 443\n  basePath: /v1\n# secure-properties: usar para secretos\n",
-                encoding="utf-8"
-            )
-
     maf = root / "mule-artifact.json"
     if not maf.exists():
-        maf.write_text('{"minMuleVersion":"4.6.0","secureProperties":[],"name":"mule-app"}\n', encoding="utf-8")
-
+        maf.write_text('{"minMuleVersion":"4.6.0","secureProperties":[]}\n', encoding="utf-8")
     pom = root / "pom.xml"
     if not pom.exists():
         pom.write_text("""<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -686,17 +671,8 @@ def write_minimum_base_files(root: Path):
   <version>1.0.0</version>
   <packaging>mule-application</packaging>
   <name>mule-app</name>
-  <properties>
-    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <mule.runtime.version>4.6.9</mule.runtime.version>
-  </properties>
 </project>
 """, encoding="utf-8")
-
-    # Exchange docs (rúbrica 26)
-    ed = root / "exchange-docs" / "home.md"
-    if not ed.exists():
-        ed.write_text("# Exchange Docs\n\nOwner: TBD\nSLA: TBD\nVersion: 1.0.0\n\nDescripción breve del API.\n", encoding="utf-8")
 
 def first_raml_target(dst_root: Path) -> Path:
     return dst_root / "src/main/resources/api/api.raml"
@@ -718,7 +694,7 @@ Actualiza el archivo indicado usando METADATOS (YAML).
 
 Reglas:
 - Mantén formato/saltos.
-- No agregues explicaciones ni ```.
+- No agregues explicaciones ni ``` .
 - Sustituye placeholders (groupId, artifactId, version, project.mule.name,
   http listener path/port, http request host/protocol/path, exchange.json main/assetId/groupId/name/version,
   y propiedades YAML app/general/upstream).
@@ -761,7 +737,6 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool):
 
     artifactId = tree.find(q("artifactId"))
     name = tree.find(q("name"))
-    groupId = tree.find(q("groupId"))
     artifact = ctx.get("artifact_id") or "mule-app"
     pname = ctx.get("project_name") or artifact
     if artifactId is None:
@@ -770,20 +745,7 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool):
     if name is None:
         name = ET.SubElement(tree, q("name"))
     name.text = pname
-    if groupId is None:
-        groupId = ET.SubElement(tree, q("groupId"))
-    groupId.text = ctx.get("group_id","com.company.experience")
 
-    # properties UTF-8 + mule.runtime.version
-    props = tree.find(q("properties")) or ET.SubElement(tree, q("properties"))
-    found_enc = props.find(q("project.build.sourceEncoding"))
-    if found_enc is None:
-        ET.SubElement(props, q("project.build.sourceEncoding")).text = "UTF-8"
-    found_rt = props.find(q("mule.runtime.version"))
-    if found_rt is None:
-        ET.SubElement(props, q("mule.runtime.version")).text = "4.6.9"
-
-    # mule-maven-plugin
     build = tree.find(q("build")) or ET.SubElement(tree, q("build"))
     plugins = build.find(q("plugins")) or ET.SubElement(build, q("plugins"))
     has_plugin = False
@@ -801,12 +763,24 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool):
         ET.SubElement(p, q("version")).text = "4.2.0"
         ET.SubElement(p, q("extensions")).text = "true"
 
-    new_txt = ET.tostring(tree, encoding="unicode")
-    pom_path.write_text(new_txt, encoding="utf-8")
+    if use_apikit:
+        deps = tree.find(q("dependencies")) or ET.SubElement(tree, q("dependencies"))
+        found = False
+        for d in deps.findall(q("dependency")):
+            gid = (d.find(q("groupId")).text if d.find(q("groupId")) is not None else "")
+            aid = (d.find(q("artifactId")).text if d.find(q("artifactId")) is not None else "")
+            if gid.strip()=="org.mule.modules" and aid.strip()=="mule-apikit-module":
+                found = True
+        if not found:
+            d = ET.SubElement(deps, q("dependency"))
+            ET.SubElement(d, q("groupId")).text = "org.mule.modules"
+            ET.SubElement(d, q("artifactId")).text = "mule-apikit-module"
+            ET.SubElement(d, q("version")).text = "1.11.0"
+            ET.SubElement(d, q("classifier")).text = "mule-plugin"
 
-# ========= README, MUnit, scripts y extras =========
+# ========= README, MUnit y script de validación =========
 
-def write_readme(root: Path, raml_info: dict, ctx: dict, service_type: str, spec_kind: str | None, rubrics_result: dict|None):
+def write_readme(root: Path, raml_info: dict, ctx: dict, service_type: str, spec_kind: str | None):
     readme = root / "README.md"
     lines = [
         "# Proyecto MuleSoft",
@@ -855,22 +829,9 @@ def write_readme(root: Path, raml_info: dict, ctx: dict, service_type: str, spec
         lines += [
             "",
             "## Nota REC / OAS",
-            "- Se copió el archivo OpenAPI a `src/main/resources/api/openapi.yaml`.",
+            "- Se copió el archivo OpenAPI a `src/main/resources/api/openapi.yaml` (genérico) o a la ruta del arquetipo Reception cuando aplica.",
             "- No se genera APIkit; usa tu estrategia (Router, Custom flows, etc.)."
         ]
-
-    # Checklist de rúbricas
-    if rubrics_result:
-        lines += [
-            "",
-            "## Checklist de Rúbricas",
-            f"- Score: **{rubrics_result.get('score_percent', 0)}%**",
-            f"- Falla por severidad B: **{'Sí' if rubrics_result.get('has_B') else 'No'}**",
-            "### Hallazgos",
-        ]
-        for it in rubrics_result.get("failures", []):
-            lines.append(f"- [{it['severity']}] {it['id']}. {it['criterion']}: {it['message']}")
-
     readme.write_text("\n".join(lines)+"\n", encoding="utf-8")
 
 def write_validate_script(root: Path):
@@ -922,199 +883,231 @@ def write_munit_min(root: Path, raml_info: dict):
 """
             (tests_dir / name).write_text(xml, encoding="utf-8")
 
-def write_common_extras(root: Path):
-    base = root / "src/main/mule/common"
-    base.mkdir(parents=True, exist_ok=True)
-    # Handler de errores con mapeo
-    (root / "src/main/mule/handler" / "handler-error.xml").write_text(common_error_handler_xml_detailed(), encoding="utf-8")
-    # Validador de headers
-    (base / "validation-headers.xml").write_text(validation_headers_xml(), encoding="utf-8")
-    # Logging/observabilidad
-    (base / "logging-observability.xml").write_text(global_logging_observability_xml(), encoding="utf-8")
-    # Healthcheck
-    (base / "healthcheck.xml").write_text(healthcheck_xml(), encoding="utf-8")
+# ========= RÚBRICAS: carga automática & evaluación =========
 
-# ========= Rúbricas (carga + evaluación) =========
-
-def load_rubrics():
-    # Ruta fija según lo subido
-    path = "/mnt/data/rubricas_scaffold_rules_v1.json"
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-def _bool(v): return bool(v)
-
-def _artifact_ok(artifact_id: str) -> bool:
-    # kebab-case sin acentos/ñ, ascii básico
-    return bool(re.match(r"^[a-z0-9]+(?:-[a-z0-9]+)*$", artifact_id or ""))
-
-def evaluate_rubrics(root: Path, ctx: dict, raml_info: dict, spec_kind: str|None, service_type: str, raml_text: str|None):
-    rules = load_rubrics()
-    if not rules:
-        return {"score_percent": 100, "has_B": False, "failures": [], "threshold": {"min_score_percent": 85, "no_B_failures": True}}
-
-    failures = []
-    sev_weight = {"B": 30, "C": 20, "M": 10, "m": 5}
-
-    def fail(id_, criterion, severity, message):
-        failures.append({"id": id_, "criterion": criterion, "severity": severity, "message": message})
-
-    # === Chequeos mínimos según rúbrica ===
-    # 1 RAML válido
-    if spec_kind == "RAML":
-        if not (raml_text or "").strip().startswith("#%RAML 1.0"):
-            fail(1, "RAML valido y parseable", "B", "Encabezado #%RAML 1.0 ausente o inválido")
-
-    # 2 Metadatos mínimos
-    if not ctx.get("project_name") or not ctx.get("version"):
-        fail(2, "Metadatos minimos", "B", "project_name/version faltantes")
-    # baseUri opcional → si falta, parametrizar por properties: aseguramos application.properties existe
-    app_props = (root / "src/main/resources/properties/application.properties").exists()
-    if not app_props:
-        fail(2, "Metadatos minimos", "B", "application.properties ausente para parametrización")
-
-    # 3 Recursos y métodos
-    if spec_kind == "RAML":
-        for r, d in raml_info.items():
-            if not d.get("methods"):
-                fail(3, "Recursos y metodos definidos", "B", f"Recurso {r} sin métodos")
-
-    # 4 Tipos de datos
-    if spec_kind == "RAML":
-        if "types:" not in (raml_text or ""):
-            fail(4, "Tipos de datos", "C", "No se detectaron 'types:' (check semilight)")
-
-    # 5 Responses consistentes (200 mínimo)
-    if spec_kind == "RAML":
-        for r, d in raml_info.items():
-            for m in d.get("methods", []):
-                if m in HTTP_METHODS and m not in d.get("res_types", {}):
-                    fail(5, "Responses consistentes", "C", f"{r} {m}: sin response 200/type detectado")
-
-    # 10 Compatibilidad versión (pom property)
-    pom_ok = (root / "pom.xml").exists() and "mule.runtime.version" in (root / "pom.xml").read_text(encoding="utf-8", errors="ignore")
-    if not pom_ok: fail(10, "Compatibilidad de versiones", "M", "mule.runtime.version no definido")
-
-    # 11 Derivación de rutas (no hardcode)
-    # Comprobamos que common/global-config.xml existe
-    gc_ok = (root / "src/main/mule/common/global-config.xml").exists()
-    if not gc_ok: fail(11, "Derivacion de rutas", "B", "global-config.xml ausente")
-
-    # 12 Naming del proyecto
-    if not _artifact_ok(ctx.get("artifact_id")):
-        fail(12, "Naming del proyecto", "B", "artifactId no cumple kebab-case ascii")
-
-    # 13 Estructura carpetas
-    for d in ["client","handler","orchestrator","common"]:
-        if not (root / f"src/main/mule/{d}").exists():
-            fail(13, "Estructura de carpetas", "B", f"Falta {d}/")
-
-    # 14 pom correcto
-    pom_txt = (root/"pom.xml").read_text(encoding="utf-8", errors="ignore") if (root/"pom.xml").exists() else ""
-    if "<packaging>mule-application</packaging>" not in pom_txt:
-        fail(14, "pom.xml correcto", "B", "Packaging incorrecto")
-    if "project.build.sourceEncoding" not in pom_txt:
-        fail(14, "pom.xml correcto", "B", "Falta UTF-8 en properties")
-
-    # 15 mule-artifact.json
-    maf_ok = (root/"mule-artifact.json").exists() and '"minMuleVersion"' in (root/"mule-artifact.json").read_text(encoding="utf-8", errors="ignore")
-    if not maf_ok:
-        fail(15, "mule-artifact.json", "C", "minMuleVersion faltante")
-
-    # 16 Listener/APIkit
-    # Si hay RAML y no es PROXY/REC, esperamos APIkit router agregado en client si raml_cp existe.
-    if spec_kind == "RAML" and service_type not in ("PROXY","REC"):
-        # verificación laxa
-        any_client = list((root/"src/main/mule/client").glob("*.xml"))
-        has_apikit = any("apikit:router" in p.read_text(encoding="utf-8", errors="ignore") for p in any_client) if any_client else False
-        if not has_apikit:
-            fail(16, "Listener y APIkit", "C", "No se detectó apikit router (laxo)")
-
-    # 17 global-config request-config
-    gc_txt = (root / "src/main/mule/common/global-config.xml").read_text(encoding="utf-8", errors="ignore") if gc_ok else ""
-    if "http:request-config" not in gc_txt and service_type != "PROXY":
-        fail(17, "global-config.xml", "B", "Sin http:request-config en common")
-
-    # 18 handler-error.xml
-    if not (root/"src/main/mule/handler/handler-error.xml").exists():
-        fail(18, "handler-error.xml", "C", "Archivo no encontrado")
-
-    # 19 validation-headers.xml
-    if not (root/"src/main/mule/common/validation-headers.xml").exists():
-        fail(19, "validation-headers.xml", "M", "Archivo no encontrado")
-
-    # 20-22 Separación por capas
-    if not list((root/"src/main/mule/client").glob("*.xml")):
-        fail(20, "Clientes por operacion", "C", "Sin archivos en client/")
-    if not list((root/"src/main/mule/handler").glob("*.xml")):
-        fail(22, "Handlers por endpoint", "M", "Sin archivos en handler/")
-    if not list((root/"src/main/mule/orchestrator").glob("*.xml")):
-        fail(21, "Orquestadores por caso de uso", "M", "Sin archivos en orchestrator/")
-
-    # 23 properties por entorno ya creados (dev/qa/prod)
-    for env in ("dev","qa","prod"):
-        if not (root / f"src/main/resources/properties/{env}-config.yaml").exists():
-            fail(23, "Properties por entorno", "C", f"Falta {env}-config.yaml")
-
-    # 24 README/script
-    if not (root/"README.md").exists():
-        fail(24, "README y scripts", "m", "README ausente")
-    if not (root/"scripts/validate-structure.sh").exists():
-        fail(24, "README y scripts", "m", "validate-structure.sh ausente")
-
-    # 25 MUnit
-    if not list((root/"src/test/munit").glob("*.xml")) and spec_kind == "RAML":
-        fail(25, "Pruebas MUnit", "m", "Sin suites generadas")
-
-    # 26 Exchange docs
-    if not (root/"exchange-docs/home.md").exists():
-        fail(26, "Exchange docs", "m", "home.md ausente")
-
-    # 27 Logging convención
-    if not (root/"src/main/mule/common/logging-observability.xml").exists():
-        fail(27, "Convenciones de logging", "M", "logging-observability.xml ausente")
-
-    # 30 Healthcheck
-    if not (root/"src/main/mule/common/healthcheck.xml").exists():
-        fail(30, "Healthcheck", "m", "healthcheck.xml ausente")
-
-    # Scoring
-    score = 100
-    for f in failures:
-        score -= sev_weight.get(f["severity"], 5)
-    score = max(0, score)
-
-    has_B = any(f["severity"] == "B" for f in failures)
+def _normalize_rubric_item(item: dict) -> dict:
     return {
-        "score_percent": score,
-        "has_B": has_B,
-        "failures": failures,
-        "threshold": rules.get("threshold", {"min_score_percent": 85, "no_B_failures": True})
+        "id": item.get("id") or item.get("code") or item.get("rule_id") or "",
+        "label": item.get("label") or item.get("title") or "",
+        "category": item.get("category") or item.get("group") or "",
+        "severity": (item.get("severity") or "WARN").upper(),
+        "autofix": bool(item.get("autofix", False)),
+        "action": (item.get("check", {}) or {}).get("action", "report_warning"),
+        "impact": item.get("impact") or "",
+        "enabled": item.get("enabled", True),
     }
+
+def _load_rubrics_from_root() -> list[dict]:
+    path = Path("Rubrics_Generation_Mule.json")
+    if not path.exists():
+        st.sidebar.warning("⚠️ No se encontró Rubrics_Generation_Mule.json en la raíz del proyecto. Se aplicarán solo validaciones básicas.")
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        arr = data.get("rubrics", data)
+        if isinstance(arr, dict): arr = [arr]
+        rubrics = [_normalize_rubric_item(x) for x in arr if isinstance(x, dict)]
+        st.sidebar.success(f"✅ Rúbricas cargadas automáticamente ({len(rubrics)} definiciones).")
+        return rubrics
+    except Exception as e:
+        st.sidebar.error(f"❌ Error al cargar rúbricas: {e}")
+        return []
+
+if not st.session_state.rubrics_defs:
+    st.session_state.rubrics_defs = _load_rubrics_from_root()
+
+def apply_rubrics_observations(root: Path, use_apikit: bool, raml_info: dict, base_notes: list[str]) -> list[str]:
+    items = [r for r in st.session_state.rubrics_defs if r.get("enabled", True)]
+
+    keywords_map = [
+        ("carpeta", ["Estructura","carpeta","folder","estructura"]),
+        ("XML sueltos", ["XML sueltos","suelto","mover a subcarpetas"]),
+        ("pom.xml", ["pom.xml"]),
+        ("mule-artifact.json", ["mule-artifact.json"]),
+        ("application.properties", ["application.properties"]),
+        ("listener", ["listener-config","global-httpListener","Listener"]),
+        ("error handler", ["common-error-handler","hdl_commonErrorHandler","error handler"]),
+        ("naming", ["Naming","-client.xml","-handler.xml","-orchestrator.xml"])
+    ]
+
+    def guess_rubric_for_note(note: str) -> dict | None:
+        note_l = note.lower()
+        candidates = []
+        for r in items:
+            text = f"{r.get('label','')} {r.get('category','')} {r.get('impact','')}".lower()
+            score = 0
+            for _, keys in keywords_map:
+                if any(k.lower() in note_l for k in keys):
+                    if any(k.lower() in text for k in keys):
+                        score += 1
+            if score>0:
+                candidates.append((score, r))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: (-x[0], x[1].get("severity","WARN")))
+        return candidates[0][1]
+
+    adorned = []
+    for note in base_notes:
+        rub = guess_rubric_for_note(note)
+        if rub:
+            sev = (rub.get("severity") or "WARN").upper()
+            if sev not in ("CRIT","WARN","INFO"): sev = "WARN"
+            rid = rub.get("id") or "R?"
+            adorned.append(f"<span class='sev-{sev}'><b>[{sev}]</b></span> ({rid}) {note}")
+        else:
+            sev = "WARN"
+            if re.search(r"\b(no bloqueante|recomendad[oa])\b", note, re.I):
+                sev = "INFO"
+            adorned.append(f"<span class='sev-{sev}'><b>[{sev}]</b></span> {note}")
+
+    shown_ids = set()
+    for line in adorned:
+        m = re.search(r"\(([^)]+)\)\s", line)
+        if m: shown_ids.add(m.group(1).strip())
+
+    pendents = []
+    for r in items:
+        if not r.get("enabled", True):
+            continue
+        sev = (r.get("severity") or "WARN").upper()
+        if sev not in ("CRIT","WARN"):  # solo lo crítico/advertencia
+            continue
+        rid = r.get("id") or ""
+        if rid and rid in shown_ids:
+            continue
+        if "apikit" in r.get("label","").lower() and not use_apikit:
+            continue
+        if r.get("label"):
+            pendents.append(f"<span class='sev-{sev}'><b>[{sev}]</b></span> ({rid}) [Rúbrica] {r.get('label')} — pendiente de verificación automática")
+
+    pendents = pendents[:12]
+    return adorned + pendents
+
+def rubric_observaciones_basic(root: Path, use_apikit: bool, raml_info: dict):
+    notes = []
+    base = root / "src/main/mule"
+
+    required_dirs = ["client","handler","orchestrator","common"]
+    for d in required_dirs:
+        if not (base/d).exists():
+            notes.append(f"[Estructura] Falta carpeta src/main/mule/{d}/")
+    loose = [str(p.relative_to(root)) for p in base.glob("*.xml")]
+    if loose:
+        notes.append("[Estructura] XML sueltos en src/main/mule (mover a subcarpetas): " + ", ".join(loose))
+
+    if not (root/"pom.xml").exists(): notes.append("[Activos] Falta pom.xml")
+    if not (root/"mule-artifact.json").exists(): notes.append("[Activos] Falta mule-artifact.json")
+    if not (root/"src/main/resources/properties/application.properties").exists(): notes.append("[Activos] Falta application.properties")
+
+    common_txt = (base/"common"/"global-config.xml").read_text("utf-8","ignore") if (base/"common"/"global-config.xml").exists() else ""
+    if use_apikit:
+        if "http:listener-config" in common_txt:
+            notes.append("[APIkit] Con APIkit no se recomienda listener-config en common/global-config.xml")
+    else:
+        if "http:listener-config" not in common_txt:
+            notes.append("[Listener] Sin APIkit, conviene listener-config en common/global-config.xml")
+        for folder in ["client","handler","orchestrator"]:
+            for p in (base/folder).glob("*.xml"):
+                if "http:listener-config" in p.read_text("utf-8","ignore"):
+                    notes.append(f"[Listener] {p.name}: listener-config centralizar en common/global-config.xml")
+
+    ceh = base/"handler"/"common-error-handler.xml"
+    if not ceh.exists():
+        notes.append("[Errores] Falta common-error-handler.xml")
+    else:
+        if "hdl_commonErrorHandler" not in ceh.read_text("utf-8","ignore"):
+            notes.append("[Errores] common-error-handler.xml: definir sub-flow 'hdl_commonErrorHandler'")
+
+    def bad_names(dirpath: Path, pattern: str, extra_ok=None):
+        extra_ok = extra_ok or set()
+        bad = []
+        for p in dirpath.glob("*.xml"):
+            if p.name in extra_ok: continue
+            if not re.match(pattern, p.name): bad.append(p.name)
+        return bad
+    bad_client = bad_names(base/"client", r'^[a-z][A-Za-z0-9]*-client\.xml$')
+    if bad_client: notes.append("[Naming] client/: " + ", ".join(bad_client))
+    bad_handler = bad_names(base/"handler", r'^[a-z][A-Za-z0-9]*-handler\.xml$', {"common-error-handler.xml"})
+    if bad_handler: notes.append("[Naming] handler/: " + ", ".join(bad_handler))
+    bad_orch = bad_names(base/"orchestrator", r'^([a-z][A-Za-z0-9]*-(get|post|put|delete|patch|head|options|retrieve|evaluate|execute|init|create|update|delete)-orchestrator|[a-z][A-Za-z0-9]*-orchestrator)\.xml$')
+    if bad_orch: notes.append("[Naming] orchestrator/: " + ", ".join(bad_orch))
+
+    return notes
+
+def rubric_observaciones(root: Path, use_apikit: bool, raml_info: dict):
+    base_notes = rubric_observaciones_basic(root, use_apikit, raml_info)
+    if st.session_state.rubrics_defs:
+        def rubric_observaciones(root: Path, use_apikit: bool, raml_info: dict):
+            """Wrapper que integra rúbricas (si están habilitadas) sobre las observaciones básicas."""
+            base_notes = rubric_observaciones_basic(root, use_apikit, raml_info)
+            if st.session_state.rubrics_defs:
+                return apply_rubrics_observations(root, use_apikit, raml_info, base_notes)
+            return base_notes
+
+  # ========= LOGGING A DATADOG =========
+
+def _backup_log_locally(payload: dict):
+    try:
+        logdir = Path("logs")
+        logdir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        (logdir / f"chatlog_{ts}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass  # no bloqueante
+
+def send_chatlog_to_datadog(event: dict):
+    """
+    Envía un único evento de log a Datadog (HTTP intake v2).
+    Si no hay API key, guarda respaldo local y retorna.
+    """
+    _backup_log_locally(event)
+    if not DD_API_KEY:
+        st.sidebar.warning("⚠️ DATADOG_API_KEY no configurada. Log guardado localmente en ./logs/")
+        return
+
+    headers = {
+        "Content-Type": "application/json",
+        "DD-API-KEY": DD_API_KEY,
+    }
+    body = [{
+        "ddsource": DD_SOURCE,
+        "service": DD_SERVICE,
+        "host": socket.gethostname(),
+        "ddtags": DD_TAGS,
+        "message": "mule_project_generation",
+        "status": "info",
+        "timestamp": int(time.time() * 1000),
+        "attributes": event
+    }]
+    try:
+        r = requests.post(DD_URL, headers=headers, data=json.dumps(body), timeout=10)
+        if r.status_code >= 300:
+            st.sidebar.error(f"Datadog log falló ({r.status_code}): {r.text[:200]}")
+        else:
+            st.sidebar.info("📤 Log de generación enviado a Datadog.")
+    except Exception as e:
+        st.sidebar.error(f"Datadog log error: {e}")
 
 # ========= Proceso principal =========
 
-def ensure_global_request_config(root: Path, ctx: dict, use_apikit: bool, service_type: str):
-    gc = root / "src/main/mule/common/global-config.xml"
-    txt = gc.read_text(encoding="utf-8", errors="ignore") if gc.exists() else ""
-    # Insertar http:request-config genérico si no es PROXY
-    if service_type != "PROXY" and "http:request-config" not in txt:
-        block = """
-  <http:request-config name="backend-request">
-    <http:request-connection protocol="${upstream.protocol}" host="${upstream.host}" port="${upstream.port}"/>
-  </http:request-config>
-""".rstrip()
-        txt = txt.replace("</mule>", f"{block}\n</mule>") if "</mule>" in txt else (txt + "\n" + block + "\n</mule>")
-        gc.write_text(txt, encoding="utf-8")
+def common_error_handler_xml():
+    header = _xml_header(False)
+    return f"""{header}
+  <!-- common error handler -->
+  <sub-flow name="hdl_commonErrorHandler">
+    <logger level="ERROR" message="type=#[error.errorType] desc=#[error.description]"/>
+  </sub-flow>
+{_xml_footer()}""".strip()
 
-def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None):
+def write_readme(root: Path, raml_info: dict, ctx: dict, service_type: str, spec_kind: str | None):
+    # (definida arriba; se mantiene)
+    pass  # placeholder para evitar redefinición accidental
+
+def procesar_arquetipo_llm(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|None, use_reception_layout: bool = False):
+    src = Path(arquetipo_dir)
     tmp_dir = Path(tempfile.mkdtemp())
-
-    with zipfile.ZipFile(arquetipo_zip, "r") as z:
-        z.extractall(tmp_dir)
+    shutil.copytree(src, tmp_dir, dirs_exist_ok=True)
 
     roots = [p for p in tmp_dir.iterdir() if p.is_dir()]
     root = roots[0] if len(roots)==1 else tmp_dir
@@ -1122,7 +1115,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     ensure_dirs(root)
     write_minimum_base_files(root)
 
-    # Reescritura guiada por LLM de todos los archivos de texto
     files_to_touch = []
     for r,_,fs in os.walk(root):
         for f in fs:
@@ -1143,7 +1135,6 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                 if path.suffix.lower() == ".xml":
                     nuevo = postprocesar_xml(nuevo, ctx)
 
-                # Validaciones sintácticas
                 ext = path.suffix.lower()
                 if path.name.lower()=="pom.xml" or ext==".xml":
                     err = validar_xml(nuevo, path.name)
@@ -1156,12 +1147,10 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
         except Exception:
             pass
 
-    # Copiar especificación
     raml_info = {}
     raml_cp_value = None
     service_type = st.session_state.get("service_type","UNKNOWN")
     spec_kind = st.session_state.get("spec_kind")
-    raml_text = st.session_state.get("raml_text")
 
     if spec_bytes:
         if spec_kind == "RAML":
@@ -1171,19 +1160,30 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                 f.write(spec_bytes)
             try:
                 raml_text = spec_bytes.decode("utf-8","ignore")
-                st.session_state.raml_text = raml_text
                 raml_info = parse_raml_semilight(raml_text)
             except Exception:
                 raml_info = {}
             if service_type not in ("PROXY","REC"):
                 raml_cp_value = raml_classpath(root)
+
         elif spec_kind == "OAS":
-            target = oas_target(root)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with open(target, "wb") as f:
-                f.write(spec_bytes)
-        elif spec_kind == "TEXT":
-            pass
+            if use_reception_layout:
+                oas_path = root / "src/main/apigee/apiproxies/referenceData/apiproxy/resources/oas/rec-reference-data.json"
+                oas_path.parent.mkdir(parents=True, exist_ok=True)
+                upname = (st.session_state.get("spec_name") or "").lower()
+                try:
+                    if upname.endswith((".yaml", ".yml")):
+                        data_oas = yaml.safe_load(spec_bytes.decode("utf-8","ignore"))
+                        oas_path.write_text(json.dumps(data_oas, ensure_ascii=False, indent=2), encoding="utf-8")
+                    else:
+                        oas_path.write_bytes(spec_bytes)
+                except Exception:
+                    oas_path.write_bytes(spec_bytes)
+            else:
+                target = oas_target(root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with open(target, "wb") as f:
+                    f.write(spec_bytes)
 
     base = root / "src/main/mule"
     client_dir = base / "client"
@@ -1191,32 +1191,25 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
     orch_dir = base / "orchestrator"
     common_dir = base / "common"
 
-    # common/ + error-handler detallado + extras por rúbrica
     ceh = handler_dir / "common-error-handler.xml"
     if not ceh.exists():
-        ceh.write_text(common_error_handler_xml_min(), encoding="utf-8")
-    # Archivos extra rúbricas (always ensure)
-    write_common_extras(root)
+        ceh.write_text(common_error_handler_xml(), encoding="utf-8")
 
     if service_type == "PROXY":
-        (common_dir / "global-config.xml").write_text(_xml_header(False) + """
-  <configuration-properties file="properties/application.properties"/>
-""" + _xml_footer(), encoding="utf-8")
+        (common_dir / "global-config.xml").write_text(common_global_config_xml(False), encoding="utf-8")
         _gen_proxy_flows(base, ctx.get("artifact_id","mule-app"))
         proto, host, port, bpath = _parse_base_uri((ctx.get("base_uri") or "") or "")
         _patch_env_properties(root, proto, host, port, bpath)
     else:
-        use_apikit = bool(raml_cp_value)
+        use_apikit = False if service_type in ("PROXY","REC") else bool(raml_cp_value)
         gc = common_dir / "global-config.xml"
         if not gc.exists():
-            gc.write_text(_xml_header(False) + """
-  <configuration-properties file="properties/application.properties"/>
-""" + _xml_footer(), encoding="utf-8")
+            gc.write_text(common_global_config_xml(use_apikit), encoding="utf-8")
 
-        # Si hay RAML: generar scaffold
-        if raml_info:
+        if raml_info and service_type not in ("PROXY","REC"):
             for recurso, data in sorted(raml_info.items()):
                 methods = data.get("methods") or {"retrieve"}
+
                 rname = safe_filename(recurso, "root")
 
                 c_path = client_dir / f"{rname}-client.xml"
@@ -1249,32 +1242,20 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
                             except ET.ParseError: xml = f"<mule><flow name='{rname}_orchestrator_{m}'/></mule>"
                             o_path.write_text(xml, encoding="utf-8")
 
-    # POM y dependencias mínimas
     enforce_pom_requirements(root, ctx, use_apikit=False if service_type in ("PROXY","REC") else bool(raml_cp_value))
 
-    # Asegurar request-config genérico si aplica
-    ensure_global_request_config(root, ctx, use_apikit=False if service_type in ("PROXY","REC") else bool(raml_cp_value), service_type=service_type)
-
-    # README, script de validación y MUnit
+    # README, script, MUnit
+    write_readme(root, raml_info, ctx, service_type, spec_kind)
     write_validate_script(root)
     if raml_info and service_type not in ("PROXY","REC"):
         write_munit_min(root, raml_info)
 
-    # Rúbricas → evaluación + observaciones
-    rub = evaluate_rubrics(root, ctx, raml_info, spec_kind, service_type, raml_text)
-    st.session_state.rubrics_result = rub
-
     notes = rubric_observaciones(root, use_apikit=False if service_type in ("PROXY","REC") else bool(raml_cp_value), raml_info=raml_info)
-    # Añadimos fallas resumidas de rúbrica como observaciones no bloqueantes
-    for f in rub.get("failures", []):
-        notes.append(f"[Rubrica-{f['severity']}] {f['id']} {f['criterion']}: {f['message']}")
     st.session_state.observaciones = notes
 
-    # README actualizado con rúbricas
-    write_readme(root, raml_info, ctx, service_type, spec_kind, rub)
-
-    # ZIP final
-    out_name = f"proyecto_mulesoft_generado_{service_type}.zip"
+    # Nombre ZIP = nombre del archivo cargado (sin extensión)
+    spec_base = Path(st.session_state.get("spec_name") or "proyecto").stem
+    out_name = f"{spec_base}.zip"
     out_zip = Path(tempfile.gettempdir()) / out_name
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for p in root.rglob("*"):
@@ -1282,83 +1263,104 @@ def procesar_arquetipo_llm(arquetipo_zip: str, ctx: dict, spec_bytes: bytes|None
 
     return str(out_zip)
 
-# ========= Observaciones previas (estáticas) =========
-def rubric_observaciones(root: Path, use_apikit: bool, raml_info: dict):
-    notes = []
-    base = root / "src/main/mule"
+# === NUEVO: ejecución encapsulada de la generación (bloquea input) ===
+def ejecutar_generacion():
+    try:
+        if not st.session_state.uploaded_spec:
+            st.session_state.messages.append({"role":"assistant","content":"⚠️ Primero adjunta un RAML, OAS (.yaml/.json) o DTM (.docx)."})
+            st.session_state.is_generating = False
+            st.session_state.pending_action = None
+            return
 
-    required_dirs = ["client","handler","orchestrator","common"]
-    for d in required_dirs:
-        if not (base/d).exists():
-            notes.append(f"[Estructura] Falta carpeta src/main/mule/{d}/")
-    loose = [str(p.relative_to(root)) for p in base.glob("*.xml")]
-    if loose:
-        notes.append("[Estructura] XML sueltos en src/main/mule (mover a subcarpetas): " + ", ".join(loose))
+        # Elegir arquetipo
+        choice = st.session_state.get("archetype_choice", "Automático")
+        svc = st.session_state.get("service_type", "UNKNOWN")
 
-    if not (root/"pom.xml").exists(): notes.append("[Activos] Falta pom.xml")
-    if not (root/"mule-artifact.json").exists(): notes.append("[Activos] Falta mule-artifact.json")
-    if not (root/"src/main/resources/properties/application.properties").exists(): notes.append("[Activos] Falta application.properties")
+        if choice == "Reception" or (choice == "Automático" and svc == "REC"):
+            arquetipo = obtener_arquetipo_reception()
+            if not arquetipo:
+                st.session_state.messages.append({"role":"assistant","content":"❌ No encontré el ZIP/carpeta Reception (Rec-Ref-Data-CustomerIdentity) en la raíz."})
+                st.session_state.is_generating = False
+                st.session_state.pending_action = None
+                return
+            use_reception_layout = True
+        else:
+            arquetipo = obtener_arquetipo_generic()
+            if not arquetipo:
+                st.session_state.messages.append({"role":"assistant","content":"❌ No encontré el arquetipo genérico (ZIP/carpeta con 'arquetipo') en la raíz."})
+                st.session_state.is_generating = False
+                st.session_state.pending_action = None
+                return
+            use_reception_layout = False
 
-    def bad_names(dirpath: Path, pattern: str, extra_ok=None):
-        extra_ok = extra_ok or set()
-        bad = []
-        for p in dirpath.glob("*.xml"):
-            if p.name in extra_ok:
-                continue
-            if not re.match(pattern, p.name):
-                bad.append(p.name)
-        return bad
-    bad_client = bad_names(base/"client", r'^[a-z][A-Za-z0-9]*-client\.xml$')
-    if bad_client: notes.append("[Naming] client/: " + ", ".join(bad_client))
-    bad_handler = bad_names(base/"handler", r'^[a-z][A-Za-z0-9]*-handler\.xml$', {"common-error-handler.xml"})
-    if bad_handler: notes.append("[Naming] handler/: " + ", ".join(bad_handler))
-    bad_orch = bad_names(base/"orchestrator", r'^([a-z][A-Za-z0-9]*-(get|post|put|delete|patch|head|options|retrieve|evaluate|execute|init|create|update|delete)-orchestrator|[a-z][A-Za-z0-9]*-orchestrator)\.xml$')
-    if bad_orch: notes.append("[Naming] orchestrator/: " + ", ".join(bad_orch))
+        st.session_state.messages.append({"role":"assistant","content":"🧠 Leyendo especificación y construyendo contexto con ChatGPT..."})
+        raw = leer_especificacion(st.session_state.uploaded_spec)
+        ctx = inferir_metadatos(raw)
 
-    for p in (base/"client").glob("*.xml"):
-        t = p.read_text("utf-8","ignore")
-        if "<flow-ref name=\"" not in t or "_handler_" not in t:
-            notes.append(f"[Flujo] {p.name}: client debe delegar a handler con flow-ref")
-        if "<http:request " in t:
-            notes.append(f"[Flujo] {p.name}: evitar http:request en client")
-        if "<error-handler>" not in t:
-            notes.append(f"[Errores] {p.name}: agregar error-handler con flow-ref a hdl_commonErrorHandler")
+        # 🔧 Forzar nombre de proyecto/artifact a partir del archivo cargado
+        base_name = Path(st.session_state.get("spec_name") or "MuleApplication").stem
+        slug = re.sub(r"[^a-zA-Z0-9]+","-", base_name).strip("-").lower()
+        slug = re.sub(r"-{2,}","-", slug) or "mule-application"
+        ctx["project_name"] = base_name
+        ctx["artifact_id"] = slug
 
-    for p in (base/"handler").glob("*.xml"):
-        if p.name == "common-error-handler.xml":
-            continue
-        t = p.read_text("utf-8","ignore")
-        if "_orchestrator_" not in t:
-            notes.append(f"[Flujo] {p.name}: handler debe delegar a orchestrator")
-        if "<http:request " in t:
-            notes.append(f"[Flujo] {p.name}: evitar http:request en handler")
-        if "<error-handler>" not in t:
-            notes.append(f"[Errores] {p.name}: agregar error-handler con flow-ref a hdl_commonErrorHandler")
+        st.session_state.messages.append({"role":"assistant","content":f"🧾 Metadatos:\n```yaml\n{yaml.safe_dump(ctx,sort_keys=False,allow_unicode=True)}\n```"})
 
-    common_txt = (base/"common"/"global-config.xml").read_text("utf-8","ignore") if (base/"common"/"global-config.xml").exists() else ""
-    if use_apikit:
-        if "http:listener-config" in common_txt:
-            notes.append("[APIkit] Con APIkit no se recomienda listener-config en common/global-config.xml")
-    else:
-        if "http:listener-config" not in common_txt:
-            notes.append("[Listener] Sin APIkit, conviene listener-config en common/global-config.xml")
-        for folder in ["client","handler","orchestrator"]:
-            for p in (base/folder).glob("*.xml"):
-                if "http:listener-config" in p.read_text("utf-8","ignore"):
-                    notes.append(f"[Listener] {p.name}: listener-config centralizar en common/global-config.xml")
+        st.session_state.uploaded_spec.seek(0)
+        spec_bytes = st.session_state.uploaded_spec.read()
 
-    ceh = base/"handler"/"common-error-handler.xml"
-    if not ceh.exists():
-        notes.append("[Errores] Falta common-error-handler.xml")
-    else:
-        if "hdl_commonErrorHandler" not in ceh.read_text("utf-8","ignore"):
-            notes.append("[Errores] common-error-handler.xml: definir sub-flow 'hdl_commonErrorHandler'")
+        work_src = preparar_arquetipo_trabajo(arquetipo)
 
-    return notes
+        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo arquetipo / PROXY / OAS + POM + README + MUnit + observaciones..."})
+        start_ts = time.time()
+        salida_zip = procesar_arquetipo_llm(str(work_src), ctx, spec_bytes, use_reception_layout=use_reception_layout)
+        end_ts = time.time()
+        st.session_state.generated_zip = salida_zip
+
+        tipo = st.session_state.get("service_type","UNKNOWN")
+        label = TYPE_LABELS.get(tipo, tipo)
+        resumen = f"✅ Proyecto generado. Tipo detectado: **{label}**."
+        if st.session_state.observaciones:
+            resumen += f"\n⚠️ Observaciones: {len(st.session_state.observaciones)} (con rúbricas)"
+        st.session_state.messages.append({"role":"assistant","content":resumen})
+        st.info(f"🔎 La API es de tipo **{label}**")
+
+        # 📤 Enviar log a Datadog
+        spec_base = Path(st.session_state.get("spec_name") or "proyecto").stem
+        dd_event = {
+            "event": "mule_project_generation",
+            "service_type": label,
+            "archetype_choice": st.session_state.get("archetype_choice"),
+            "spec_name": st.session_state.get("spec_name"),
+            "spec_kind": st.session_state.get("spec_kind"),
+            "output_zip": Path(salida_zip).name,
+            "observations_count": len(st.session_state.get("observaciones", [])),
+            "rubrics_count": len(st.session_state.get("rubrics_defs", [])),
+            "metadatos": ctx,
+            "chat_history": st.session_state.get("messages", []),
+            "started_at": datetime.datetime.utcfromtimestamp(start_ts).isoformat()+"Z",
+            "finished_at": datetime.datetime.utcfromtimestamp(end_ts).isoformat()+"Z",
+            "duration_seconds": round(end_ts - start_ts, 3),
+            "host": socket.gethostname(),
+        }
+        send_chatlog_to_datadog(dd_event)
+
+    except Exception as e:
+        st.session_state.messages.append({"role":"assistant","content":f"⚠️ Generación con advertencias: {e}"})
+    finally:
+        st.session_state.is_generating = False
+        st.session_state.pending_action = None
 
 # ========= Chat/acciones =========
 
 def manejar_mensaje(user_input: str):
+    if st.session_state.get("is_generating", False):
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "⛔ Generación en curso. Espera a que termine para enviar nuevos mensajes."
+        })
+        return
+
     ui = user_input.strip().lower()
 
     if ui in ("crear proyecto","crea el proyecto","genera el proyecto","crea el proyecto"):
@@ -1366,44 +1368,44 @@ def manejar_mensaje(user_input: str):
             st.session_state.messages.append({"role":"assistant","content":"⚠️ Primero adjunta un RAML, OAS (.yaml/.json) o DTM (.docx)."})
             return
 
-        arquetipo = obtener_arquetipo()
-        if not arquetipo:
-            st.session_state.messages.append({"role":"assistant","content":"❌ No encontré un ZIP con 'arquetipo' en el directorio."})
-            return
-
-        st.session_state.messages.append({"role":"assistant","content":"🧠 Leyendo especificación y construyendo contexto con ChatGPT..."})
-        raw = leer_especificacion(st.session_state.uploaded_spec)
-        ctx = inferir_metadatos(raw)
-
-        st.session_state.messages.append({"role":"assistant","content":f"🧾 Metadatos:\n```yaml\n{yaml.safe_dump(ctx,sort_keys=False,allow_unicode=True)}\n```"})
-
-        st.session_state.uploaded_spec.seek(0)
-        spec_bytes = st.session_state.uploaded_spec.read()
-
-        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo arquetipo / PROXY / OAS + POM + README + MUnit + rúbricas..."})
-        try:
-            salida_zip = procesar_arquetipo_llm(arquetipo, ctx, spec_bytes)
-            st.session_state.generated_zip = salida_zip
-
-            tipo = st.session_state.get("service_type","UNKNOWN")
-            label = TYPE_LABELS.get(tipo, tipo)
-            rub = st.session_state.get("rubrics_result") or {}
-            resumen = f"✅ Proyecto generado. Tipo detectado: **{label}**.\n"
-            resumen += f"📊 Score rúbricas: **{rub.get('score_percent',0)}%** | "
-            resumen += f"No_B_failures: **{'OK' if not rub.get('has_B') else 'FALLA'}** | "
-            thr = rub.get("threshold", {})
-            resumen += f"Umbral: **{thr.get('min_score_percent',85)}%**"
-            if st.session_state.observaciones:
-                resumen += f"\n⚠️ Observaciones: {len(st.session_state.observaciones)} (no bloqueantes)"
-            st.session_state.messages.append({"role":"assistant","content":resumen})
-
-            # Mostrar el tipo SOLO tras generar
-            st.info(f"🔎 La API es de tipo **{label}**")
-
-        except Exception as e:
-            st.session_state.messages.append({"role":"assistant","content":f"⚠️ Generación con advertencias: {e}"})
+        st.session_state.is_generating = True
+        st.session_state.pending_action = "generate"
+        st.session_state.messages.append({"role":"assistant","content":"⏳ Iniciando generación... la entrada quedará deshabilitada hasta finalizar."})
+        st.rerun()
+        return
     else:
         st.session_state.messages.append({"role":"assistant","content":"💬 Escribe `crea el proyecto` para generar el zip a partir de tu especificación."})
+
+# ========= Upload =========
+
+spec = st.file_uploader(
+    "Adjunta la especificación (RAML, OAS .yaml/.json o DTM .docx)",
+    type=["raml","yaml","yml","json","docx"]
+)
+if spec and st.session_state.uploaded_spec is None:
+    st.session_state.uploaded_spec = spec
+    st.session_state.spec_name = spec.name
+    stype = _map_prefix_to_type(spec.name)
+    st.session_state.service_type = stype if stype else "UNKNOWN"
+    leer_especificacion(spec)
+    st.session_state.messages.append({
+        "role":"assistant",
+        "content":f"📄 Archivo \"{spec.name}\" cargado. Escribe **crea el proyecto**."
+    })
+
+# === Selector de arquetipo (auto / reception / genérico) ===
+if st.session_state.get("uploaded_spec"):
+    choices = ["Automático", "Reception (Rec-Ref-Data-CustomerIdentity)", "Genérico"]
+    default_idx = 0
+    if st.session_state.get("service_type") == "REC":
+        default_idx = 0
+    st.session_state.archetype_choice = st.radio(
+        "Arquetipo a usar",
+        choices,
+        index=default_idx,
+        horizontal=True,
+        key="arch_choice_radio"
+    )
 
 # ====== Render historial ======
 with st.container():
@@ -1418,19 +1420,44 @@ with st.container():
 
 # ====== Observaciones ======
 if st.session_state.get("observaciones"):
-    st.markdown("### ⚠️ Observaciones de Rúbricas (no bloqueantes)")
-    st.markdown("\n".join(f"- {o}" for o in st.session_state.observaciones))
+    st.markdown("### ⚠️ Observaciones de Calidad (con rúbricas)")
+    for o in st.session_state.observaciones:
+        st.markdown(f"- {o}", unsafe_allow_html=True)
 
-# ====== Entrada chat ======
-user_input = st.chat_input("Escribe aquí...")
-if user_input:
-    st.session_state.messages.append({"role":"user","content":user_input})
-    manejar_mensaje(user_input)
+# === Oculta cualquier chat_input del DOM si hay generación ===
+if st.session_state.get("is_generating", False):
+    st.markdown(
+        "<style>div[data-testid='stChatInput']{display:none !important}</style>",
+        unsafe_allow_html=True
+    )
+
+# === Si hay generación pendiente, ejecutarla ===
+if st.session_state.is_generating and st.session_state.pending_action == "generate":
+    with st.spinner("Generando proyecto..."):
+        ejecutar_generacion()
     st.rerun()
+
+# ====== Entrada chat (único contenedor) ======
+chat_area = st.empty()
+
+if st.session_state.get("is_generating", False):
+    with chat_area:
+        st.markdown(
+            "<div style='opacity:.75; padding:10px; border:1px dashed #bbb; border-radius:10px;'>"
+            "⏳ <b>Generando proyecto…</b> El chat está temporalmente deshabilitado."
+            "</div>",
+            unsafe_allow_html=True
+        )
+else:
+    with chat_area:
+        user_input = st.chat_input("Escribe aquí...", key="chat_input_main_v3")
+        if user_input:
+            st.session_state.messages.append({"role":"user","content":user_input})
+            manejar_mensaje(user_input)
+            st.rerun()
 
 # ====== Descarga ======
 if st.session_state.generated_zip:
-    # Mostrar el tipo solo en esta fase
     tipo = st.session_state.get("service_type","UNKNOWN")
     st.info(f"🔎 La API es de tipo **{TYPE_LABELS.get(tipo, tipo)}**")
 
