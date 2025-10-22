@@ -1,0 +1,428 @@
+{
+  "rubrics_version": "1.0.0",
+  "mode": "non-blocking",
+  "generated_from": [
+    "mx-api-bc-dom-customer-credit-rating",
+    "mx-api-bc-dom-location-data-management",
+    "mx-api-bc-dom-party-lifecycle-management"
+  ],
+  "rubrics": [
+    {
+      "id": "A1_RAML_META_MIN",
+      "category": "Metadata",
+      "criterion": "Metadatos mínimos presentes",
+      "description": "Asegurar que el RAML contenga #%RAML 1.0, title, version, baseUri con ${HOST_NAME}, mediaType application/json y protocols HTTPS.",
+      "severity": "WARN",
+      "autofix": true,
+      "check": {
+        "verify": [
+          "raml.parse",
+          "raml.resolve"
+        ],
+        "action": "report_warning"
+      },
+      "impact": "Consistencia documental y despliegue por entorno."
+    },
+    {
+      "id": "A2_LIB_TYPES_RESOLUTION",
+      "category": "Metadata",
+      "criterion": "Resolución de librerías y tipos",
+      "description": "Garantizar que 'uses.lib' y todos los 'types' referenciados se resuelvan sin enlaces rotos.",
+      "severity": "CRIT",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "attempt_autofix_and_report"
+      },
+      "impact": "Evita fallas en transformaciones y contratos."
+    },
+    {
+      "id": "A3_COMMON_RESPONSES_AVAILABLE",
+      "category": "Traits/Respuestas",
+      "criterion": "Disponibilidad de 'common-responses'",
+      "description": "Asegurar que el trait de respuestas estandarizadas esté disponible (vendorizado o descargable) con firma {typeName, exampleRs}.",
+      "severity": "CRIT",
+      "autofix": true,
+      "check": {
+        "verify": [
+          "uses.common-responses",
+          "traits.responsesXXX"
+        ],
+        "action": "attempt_autofix_and_report"
+      },
+      "impact": "Estandariza el manejo de éxitos y errores."
+    },
+    {
+      "id": "A4_SECURITY_OR_HEADERS",
+      "category": "Metadata",
+      "criterion": "Seguridad declarada o headers comunes",
+      "description": "Si no hay securitySchemes/securedBy, declarar/usar headers comunes (consumerRequestId, token) para validación básica.",
+      "severity": "INFO",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Base para políticas en API Manager."
+    },
+    {
+      "id": "B1_METHOD_2XX",
+      "category": "Contratos",
+      "criterion": "Cada método define respuesta 2xx",
+      "description": "Todo resource+method debe declarar al menos una respuesta 2xx con typeName válido.",
+      "severity": "CRIT",
+      "autofix": true,
+      "check": {
+        "verify": [
+          "responses.2xx",
+          "examples"
+        ],
+        "action": "attempt_autofix_and_report"
+      },
+      "impact": "Contrato mínimo para happy path."
+    },
+    {
+      "id": "B2_MIN_EXAMPLES",
+      "category": "Contratos",
+      "criterion": "Ejemplos mínimos por operación",
+      "description": "Existencia de example de request y de response 2xx, y al menos errores principales (400/401/403/404/408/500).",
+      "severity": "WARN",
+      "autofix": false,
+      "check": {
+        "verify": [
+          "responses.2xx",
+          "examples"
+        ],
+        "action": "report_warning"
+      },
+      "impact": "Facilita MUnit y validación de DW."
+    },
+    {
+      "id": "B3_VERB_STATUS_CONSISTENCY",
+      "category": "Contratos",
+      "criterion": "Coherencia verbo↔status",
+      "description": "POST=200/201; PUT/PATCH=200/204; GET=200, consistente en el dominio.",
+      "severity": "INFO",
+      "autofix": false,
+      "check": {
+        "verify": [
+          "responses.2xx",
+          "examples"
+        ],
+        "action": "report_warning"
+      },
+      "impact": "Claridad semántica y expectativas de consumidor."
+    },
+    {
+      "id": "B4_HEADERS_DECLARED",
+      "category": "Contratos",
+      "criterion": "Headers recurrentes declarados",
+      "description": "Declarar consumerRequestId/token (u otros) con required/enums/patterns si aplica.",
+      "severity": "INFO",
+      "autofix": true,
+      "check": {
+        "verify": [
+          "responses.2xx",
+          "examples"
+        ],
+        "action": "report_warning"
+      },
+      "impact": "Validaciones homogéneas y trazabilidad."
+    },
+    {
+      "id": "B5_TRAITS_EXPANSION",
+      "category": "Contratos",
+      "criterion": "Traits y resourceTypes expandibles",
+      "description": "Traits/resourceTypes deben poder expandirse determinísticamente para scaffolding.",
+      "severity": "WARN",
+      "autofix": true,
+      "check": {
+        "verify": [
+          "responses.2xx",
+          "examples"
+        ],
+        "action": "report_warning"
+      },
+      "impact": "Plantillas de generación predecibles."
+    },
+    {
+      "id": "C1_PATTERN_SELECTION",
+      "category": "Estructura",
+      "criterion": "Selección de patrón por verbo",
+      "description": "GET simple → patrón ligero (flow+DW); POST/PUT/PATCH → tripleta client/handler/orchestrator.",
+      "severity": "INFO",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Proyecto más simple y mantenible."
+    },
+    {
+      "id": "C2_TRIPLET_COMPLETENESS",
+      "category": "Estructura",
+      "criterion": "Tripleta por operación no trivial",
+      "description": "Por cada método no-GET simple debe existir client, handler y orchestrator.",
+      "severity": "WARN",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Aísla responsabilidades y facilita testing."
+    },
+    {
+      "id": "C3_APIKIT_RESOLUTION",
+      "category": "Estructura",
+      "criterion": "APIKit resuelve el RAML",
+      "description": "El apikit:config debe apuntar a un RAML accesible localmente o via fetch en build.",
+      "severity": "CRIT",
+      "autofix": true,
+      "check": {
+        "verify": [
+          "raml.parse",
+          "raml.resolve"
+        ],
+        "action": "attempt_autofix_and_report"
+      },
+      "impact": "Evita fallos de enrutamiento."
+    },
+    {
+      "id": "C4_NAMING_CONVENTION",
+      "category": "Estructura",
+      "criterion": "Convención de nombres determinista",
+      "description": "<verbo>-<familia>-<acción>-client|handler|orchestrator y nombres de flows homólogos.",
+      "severity": "WARN",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Navegabilidad y consistencia CI."
+    },
+    {
+      "id": "C5_COMMON_STRUCTURE",
+      "category": "Estructura",
+      "criterion": "Estructura mínima de carpetas",
+      "description": "client/, handler/, orchestrator/, common/, resources/dwl/, src/test/munit/.",
+      "severity": "WARN",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Homologación entre proyectos."
+    },
+    {
+      "id": "D1_HEADERS_VALIDATION_SUBFLOW",
+      "category": "Common",
+      "criterion": "Subflow de validación de headers",
+      "description": "Validar headers obligatorios en un subflow reutilizable (raise-error CUSTOM).",
+      "severity": "INFO",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Seguridad básica y trazabilidad."
+    },
+    {
+      "id": "D2_ERROR_HANDLER_GLOBAL",
+      "category": "Common",
+      "criterion": "Error handler global estandarizado",
+      "description": "On-error para APIKIT, HTTP, CLIENT_RESPONSE, JSON con mapping DW a commonErrorRs.",
+      "severity": "CRIT",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "attempt_autofix_and_report"
+      },
+      "impact": "Respuestas homogéneas y observabilidad."
+    },
+    {
+      "id": "D3_LOGGING_CORRELATION",
+      "category": "Common",
+      "criterion": "Logging estructurado y correlationId",
+      "description": "Variables de logging y MDC/correlationId en subflow común.",
+      "severity": "INFO",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Trazabilidad operativa."
+    },
+    {
+      "id": "D4_AUTODISCOVERY_READY",
+      "category": "Common",
+      "criterion": "AutoDiscovery parametrizable",
+      "description": "Parámetro apiId presente en properties y etiqueta en interface.",
+      "severity": "INFO",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Habilita políticas en API Manager."
+    },
+    {
+      "id": "E1_DW_REQUEST_RESPONSE",
+      "category": "DataWeave",
+      "criterion": "DW de request/response por operación",
+      "description": "Generar transformaciones conforme a lib.*Rq/lib.*Rs con shape mínimo correcto.",
+      "severity": "WARN",
+      "autofix": false,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Menos defectos por schema."
+    },
+    {
+      "id": "E2_DW_UTILS_MODULES",
+      "category": "DataWeave",
+      "criterion": "Módulos utilitarios DW",
+      "description": "ErrorUtils/HeadersUtils para centralizar lógicas repetidas.",
+      "severity": "INFO",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Reuso y menor duplicidad."
+    },
+    {
+      "id": "E3_DW_ERROR_MAPPINGS",
+      "category": "DataWeave",
+      "criterion": "Mapeos DW de errores por código",
+      "description": "DWs por 400/401/403/404/408/500 que generen commonErrorRs.",
+      "severity": "CRIT",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "attempt_autofix_and_report"
+      },
+      "impact": "Respuestas de error coherentes."
+    },
+    {
+      "id": "F1_PROPERTIES_ENV",
+      "category": "Parametrización",
+      "criterion": "Properties por entorno",
+      "description": "general.path, puertos, timeouts y endpoints downstream parametrizados para local/dev/qa/prod.",
+      "severity": "WARN",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Portabilidad y despliegue controlado."
+    },
+    {
+      "id": "F2_SECURE_PROPERTIES",
+      "category": "Parametrización",
+      "criterion": "Secretos en secure-properties",
+      "description": "Credenciales/keys se manejan en secure-properties (si aplica).",
+      "severity": "INFO",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Seguridad y cumplimiento."
+    },
+    {
+      "id": "F3_CLIENT_CONFIG",
+      "category": "Parametrización",
+      "criterion": "Cliente HTTP dedicado vs genérico",
+      "description": "Dedicado si timeouts/headers difieren; genérico si comparten configuración.",
+      "severity": "INFO",
+      "autofix": false,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Balance entre simplicidad y flexibilidad."
+    },
+    {
+      "id": "G1_MUNIT_HAPPY_PATH",
+      "category": "MUnit",
+      "criterion": "Suite MUnit happy path por operación",
+      "description": "Al menos una prueba feliz usando examples 2xx.",
+      "severity": "WARN",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Previene regresiones básicas."
+    },
+    {
+      "id": "G2_MUNIT_ERRORS",
+      "category": "MUnit",
+      "criterion": "Pruebas de errores principales",
+      "description": "Pruebas para 400/401/403/404/408/500 cuando existan examples.",
+      "severity": "INFO",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Cobertura mínima de resiliencia."
+    },
+    {
+      "id": "G3_MUNIT_ASSETS_REUSE",
+      "category": "MUnit",
+      "criterion": "Activos de test reutilizables",
+      "description": "Mocks/transform DW utilitarios compartidos por suites.",
+      "severity": "INFO",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Mantenibilidad de suites."
+    },
+    {
+      "id": "H1_RUNTIME_COMPAT",
+      "category": "Build",
+      "criterion": "Compatibilidad de runtime",
+      "description": "app.runtime y Java compatibles (4.6.x + Java 17 típico en proyectos analizados).",
+      "severity": "WARN",
+      "autofix": false,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "Compilación y ejecución estables."
+    },
+    {
+      "id": "H2_MMP_CONFIG",
+      "category": "Build",
+      "criterion": "mule-maven-plugin configurado",
+      "description": "Plugin y perfiles CloudHub 2 listos si aplica (sin detener generación).",
+      "severity": "INFO",
+      "autofix": true,
+      "check": {
+        "verify": [],
+        "action": "report_warning"
+      },
+      "impact": "CI/CD más fluido."
+    },
+    {
+      "id": "H3_APIKIT_TEST_COMPILE",
+      "category": "Build",
+      "criterion": "Compilación seca APIKit",
+      "description": "Verificación de que APIKit y rutas compilan con el RAML resoluble.",
+      "severity": "CRIT",
+      "autofix": false,
+      "check": {
+        "verify": [
+          "raml.parse",
+          "raml.resolve"
+        ],
+        "action": "attempt_autofix_and_report"
+      },
+      "impact": "Evita fallas en arranque del servicio."
+    }
+  ]
+}
