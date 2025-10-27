@@ -1,0 +1,189 @@
+{
+  "version": "1.0",
+  "goal": "Generar scaffold de proyecto Apigee a partir de una especificación OAS con prácticas institucionales coherentes con los 4 proyectos analizados.",
+  "criteria": [
+    {
+      "id": "structure.apiproxy",
+      "weight": 0.08,
+      "description": "Estructura mínima apiproxy (descriptor, proxies, targets, policies, resources).",
+      "checks": [
+        {
+          "key": "has_apiproxy_root",
+          "severity": "critical",
+          "expected": true,
+          "action_on_fail": "create_structure"
+        },
+        {
+          "key": "has_apiproxy_descriptor",
+          "severity": "high",
+          "expected": true,
+          "action_on_fail": "generate_descriptor_from_oas_info"
+        }
+      ]
+    },
+    {
+      "id": "proxy.base",
+      "weight": 0.12,
+      "description": "ProxyEndpoint con BasePath/VirtualHost derivados de OAS.servers[0].url.",
+      "checks": [
+        {
+          "key": "proxy.basepath.from_servers",
+          "severity": "high",
+          "expected": true,
+          "action_on_fail": "infer_basepath_from_oas"
+        },
+        {
+          "key": "proxy.virtualhost.configured",
+          "severity": "high",
+          "expected": true,
+          "action_on_fail": "set_virtualhost_default"
+        }
+      ]
+    },
+    {
+      "id": "flows.mapping",
+      "weight": 0.2,
+      "description": "Flows 1:1 por path+método del OAS con Condition adecuada.",
+      "checks": [
+        {
+          "key": "flow.per_operation",
+          "severity": "critical",
+          "expected": true,
+          "action_on_fail": "create_flows_from_paths_methods"
+        },
+        {
+          "key": "flow.condition.matchespath_and_verb",
+          "severity": "high",
+          "expected": true,
+          "action_on_fail": "fix_flow_conditions"
+        }
+      ]
+    },
+    {
+      "id": "security.policies",
+      "weight": 0.18,
+      "description": "Políticas de seguridad según components.securitySchemes.",
+      "checks": [
+        {
+          "key": "security.apikey.verify",
+          "severity": "high",
+          "expected": "conditional(apiKey)",
+          "action_on_fail": "add_verify_apikey"
+        },
+        {
+          "key": "security.oauth2_or_jwt.verify",
+          "severity": "high",
+          "expected": "conditional(oauth2|bearer)",
+          "action_on_fail": "add_oauth_or_jwt_verify"
+        },
+        {
+          "key": "security.global_or_operation_level",
+          "severity": "medium",
+          "expected": "global_or_defined",
+          "action_on_fail": "align_security_scope"
+        }
+      ]
+    },
+    {
+      "id": "durability.controls",
+      "weight": 0.16,
+      "description": "Dureza: SpikeArrest, Quota, JSONThreatProtection en PreFlow.",
+      "checks": [
+        {
+          "key": "preflow.spikearrest.present",
+          "severity": "high",
+          "expected": true,
+          "action_on_fail": "add_spikearrest"
+        },
+        {
+          "key": "preflow.quota.present",
+          "severity": "high",
+          "expected": true,
+          "action_on_fail": "add_quota"
+        },
+        {
+          "key": "preflow.json_threat_protection.present",
+          "severity": "high",
+          "expected": true,
+          "action_on_fail": "add_jtp"
+        }
+      ]
+    },
+    {
+      "id": "errors.standardization",
+      "weight": 0.1,
+      "description": "Manejo de errores uniforme con RaiseFault y payload JSON estándar.",
+      "checks": [
+        {
+          "key": "fault.401_403_429_500.policies",
+          "severity": "medium",
+          "expected": true,
+          "action_on_fail": "add_raisefault_standard"
+        },
+        {
+          "key": "fault.payload.json",
+          "severity": "medium",
+          "expected": true,
+          "action_on_fail": "ensure_json_error_payload"
+        }
+      ]
+    },
+    {
+      "id": "observability.headers",
+      "weight": 0.08,
+      "description": "AssignMessage con X-Correlation-Id y X-Forwarded-For.",
+      "checks": [
+        {
+          "key": "assignmessage.correlation_id",
+          "severity": "medium",
+          "expected": true,
+          "action_on_fail": "add_assignmessage_headers"
+        }
+      ]
+    },
+    {
+      "id": "targets.timeouts",
+      "weight": 0.08,
+      "description": "TargetEndpoint con URL/TargetServer y timeouts (connect/io).",
+      "checks": [
+        {
+          "key": "target.url_or_server",
+          "severity": "high",
+          "expected": true,
+          "action_on_fail": "set_target_from_servers"
+        },
+        {
+          "key": "target.timeouts",
+          "severity": "medium",
+          "expected": true,
+          "action_on_fail": "add_timeouts_defaults"
+        }
+      ]
+    }
+  ],
+  "scaffold_defaults": {
+    "virtualhost": "default",
+    "timeouts": {
+      "connect.timeout.millis": 5000,
+      "io.timeout.millis": 60000
+    },
+    "preflow_order": [
+      "AM-Set-Standard-Headers",
+      "SA-Base",
+      "Q-Base",
+      "VAK-ApiKey|OA-VerifyToken|JWT-Verify",
+      "JTP-Request"
+    ],
+    "policy_prefixes": {
+      "AssignMessage": "AM-",
+      "SpikeArrest": "SA-",
+      "Quota": "Q-",
+      "VerifyAPIKey": "VAK-",
+      "OAuthV2": "OA-",
+      "JWT": "JWT-",
+      "JSONThreatProtection": "JTP-",
+      "RaiseFault": "RF-"
+    },
+    "flow_condition_template": "(proxy.pathsuffix MatchesPath \"{path}\") and (request.verb = \"{VERB}\")"
+  }
+}

@@ -1,3 +1,4 @@
+import io
 import tempfile, zipfile, re, os, sys, types
 import xml.etree.ElementTree as ET
 import yaml
@@ -59,7 +60,7 @@ st.markdown("""
 assistant_avatar = "https://cdn-icons-png.flaticon.com/512/4712/4712109.png"
 user_avatar = "https://cdn-icons-png.flaticon.com/512/1077/1077012.png"
 
-st.markdown("<h1 style='text-align:center;'>🤖 Generador de Proyectos Mulesoft</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center;'>🤖 Generador de Proyectos</h1>", unsafe_allow_html=True)
 
 # ====== Estado ======
 if "messages" not in st.session_state: st.session_state.messages = []
@@ -69,13 +70,11 @@ if "observaciones" not in st.session_state: st.session_state.observaciones = []
 if "service_type" not in st.session_state: st.session_state.service_type = "UNKNOWN"
 if "spec_name" not in st.session_state: st.session_state.spec_name = None
 if "spec_kind" not in st.session_state: st.session_state.spec_kind = None   # "RAML" | "OAS" | "TEXT"
-# === Flags para bloquear el chat mientras se genera ===
 if "is_generating" not in st.session_state: st.session_state.is_generating = False
 if "pending_action" not in st.session_state: st.session_state.pending_action = None
-# === Selector de arquetipo ===
 if "archetype_choice" not in st.session_state: st.session_state.archetype_choice = "Automático"
-# === Rúbricas (siempre cargadas desde raíz) ===
 if "rubrics_defs" not in st.session_state: st.session_state.rubrics_defs = []
+if "rubrics_kind" not in st.session_state: st.session_state.rubrics_kind = "mule"  # mule|apigee
 
 TYPE_LABELS = {
     "REC": "RECEPTION",
@@ -95,7 +94,7 @@ with col2:
 
 # ========= Utilidades =========
 
-TEXT_EXTS = {".xml",".json",".yaml",".yml",".raml",".properties",".txt",".pom",".md"}
+TEXT_EXTS = {".xml",".json",".yaml",".yml",".raml",".properties",".txt",".pom",".md",".js"}
 INVALID_WIN = r'[:*?"<>|\\/]'
 
 def safe_filename(stx: str, fallback: str = "root") -> str:
@@ -107,24 +106,66 @@ def safe_filename(stx: str, fallback: str = "root") -> str:
     return s or fallback
 
 def _map_prefix_to_type(filename: str) -> str | None:
-    m = re.match(r"^(Rec|DOM|Dom|BUS|Bus|PRO|Pro)_", filename or "")
-    if not m: return None
-    pref = m.group(1).lower()
-    if pref == "rec": return "REC"
-    if pref == "dom": return "DOM"
-    if pref == "bus": return "BUS"
-    if pref == "pro": return "PROXY"
+    """Detecta tipo por prefijo o patrón en el nombre del archivo."""
+    if not filename:
+        return None
+    fname = filename.lower()
+    # prefijos tradicionales
+    m = re.match(r"^(rec|dom|bus|pro)[-_]", fname)
+    if m:
+        pref = m.group(1)
+        return {"rec":"REC","dom":"DOM","bus":"BUS","pro":"PROXY"}.get(pref)
+    # patrones en medio del nombre (ej: mx-api-bc-rec-..., mx-api-bc-dom-...)
+    if "-rec-" in fname or fname.startswith("rec-") or fname.endswith("-rec.zip"):
+        return "REC"
+    if "-dom-" in fname or fname.startswith("dom-"):
+        return "DOM"
+    if "proxy" in fname:
+        return "PROXY"
     return None
 
 def leer_especificacion(file) -> str:
-    name = file.name.lower()
+    """
+    Lee la especificación subida. Si es ZIP, extrae el mejor candidato y
+    deja en session_state:
+      - extracted_kind, extracted_name, extracted_bytes, ctx_text
+    Devuelve texto para armar el contexto del LLM.
+    """
+    name = (file.name or "").lower()
     file.seek(0)
+
+    # === Nuevo: ZIP de diseños ===
+    if name.endswith(".zip"):
+        st.session_state.spec_kind = "ZIP"
+        data = file.read()
+        with zipfile.ZipFile(io.BytesIO(data), "r") as z:
+            kind, inner_name, inner_bytes = _best_candidate_from_zip(z)
+
+        st.session_state.extracted_kind = kind
+        st.session_state.extracted_name = inner_name
+        st.session_state.extracted_bytes = inner_bytes
+
+        if kind == "TEXT":
+            ctx_text = _read_docx_bytes(inner_bytes) if inner_name.lower().endswith(".docx") \
+                       else inner_bytes.decode("utf-8", "ignore")
+        else:
+            # OAS/RAML/RAW → intentar decodificar; si falla, queda vacío
+            try:
+                ctx_text = inner_bytes.decode("utf-8", "ignore")
+            except Exception:
+                ctx_text = ""
+        st.session_state.ctx_text = ctx_text
+        return ctx_text
+
+    # === Compatibilidad: archivos sueltos ===
     if name.endswith(".raml"):
         st.session_state.spec_kind = "RAML"
         return file.read().decode("utf-8", errors="ignore")
-    if name.endswith((".yaml",".yml",".json")):
+
+    if name.endswith((".yaml", ".yml", ".json")):
         st.session_state.spec_kind = "OAS"
         return file.read().decode("utf-8", errors="ignore")
+
     if name.endswith(".docx"):
         st.session_state.spec_kind = "TEXT"
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
@@ -132,8 +173,63 @@ def leer_especificacion(file) -> str:
             path = tmp.name
         doc = Document(path)
         return "\n".join(p.text for p in doc.paragraphs)
+
     st.session_state.spec_kind = None
     return ""
+
+def _read_docx_bytes(b: bytes) -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+        tmp.write(b)
+        path = tmp.name
+    try:
+        doc = Document(path)
+        return "\n".join(p.text for p in doc.paragraphs)
+    finally:
+        try: os.remove(path)
+        except: pass
+
+def _best_candidate_from_zip(z: zipfile.ZipFile) -> tuple[str,str,bytes]:
+    """
+    Retorna (kind, inner_name, bytes) priorizando:
+    1) openapi.(yaml|yml|json) o *openapi*.*
+    2) *.raml
+    3) *.docx
+    4) README(.md|.txt)
+    5) cualquier .yaml/.json como último recurso
+    kind ∈ {"OAS","RAML","TEXT","RAW"}
+    """
+    names = z.namelist()
+    # 1) OpenAPI
+    cand = [n for n in names if re.search(r"(^|/)(openapi\.(ya?ml|json))$", n, re.I)]
+    cand += [n for n in names if re.search(r"openapi.*\.(ya?ml|json)$", n, re.I)]
+    if cand:
+        n = cand[0]; return ("OAS", n, z.read(n))
+
+    # 2) RAML
+    raml = [n for n in names if n.lower().endswith(".raml")]
+    if raml:
+        n = raml[0]; return ("RAML", n, z.read(n))
+
+    # 3) DOCX
+    docx = [n for n in names if n.lower().endswith(".docx")]
+    if docx:
+        n = docx[0]; return ("TEXT", n, z.read(n))
+
+    # 4) README
+    rd = [n for n in names if re.search(r"readme(\.md|\.txt)?$", n, re.I)]
+    if rd:
+        n = rd[0]; return ("TEXT", n, z.read(n))
+
+    # 5) YAML/JSON genérico
+    yj = [n for n in names if re.search(r"\.(ya?ml|json)$", n, re.I)]
+    if yj:
+        n = yj[0]
+        ext = n.split(".")[-1].lower()
+        kind = "OAS" if ext in ("yaml","yml","json") else "RAW"
+        return (kind, n, z.read(n))
+
+    # si no hay nada textual, devolvemos el ZIP entero como bytes “raw”
+    return ("RAW", names[0] if names else "bundle.zip", z.read(names[0])) if names else ("RAW","bundle.zip",b"")
 
 # ✅ Validadores
 def validar_xml(txt: str, archivo: str) -> str|None:
@@ -150,7 +246,7 @@ def validar_yaml(txt: str, archivo: str) -> str|None:
     except yaml.YAMLError as e:
         return f"⚠️ {archivo}: Error YAML → {e}"
 
-# === Arquetipos: genérico y Reception ===
+# === Arquetipos ===
 
 def _file_sha256(path: str, chunk=1024*1024) -> str:
     h = hashlib.sha256()
@@ -164,10 +260,10 @@ def _file_sha256(path: str, chunk=1024*1024) -> str:
 def obtener_arquetipo_generic() -> str | None:
     for f in os.listdir():
         p = Path(f)
-        if p.is_dir() and "arquetipo" in p.name.lower():
+        if p.is_dir() and "arquetipo" in p.name.lower() and "reception" not in p.name.lower():
             return str(p.resolve())
     for f in os.listdir():
-        if f.endswith(".zip") and "arquetipo" in f.lower():
+        if f.endswith(".zip") and "arquetipo" in f.lower() and "reception" not in f.lower():
             return str(Path(f).resolve())
     demo = "/mnt/data/arquetipo-mulesoft.zip"
     if os.path.exists(demo):
@@ -177,11 +273,21 @@ def obtener_arquetipo_generic() -> str | None:
 def obtener_arquetipo_reception() -> str | None:
     for f in os.listdir():
         p = Path(f)
+        if p.is_dir() and "arquetipo-reception" in p.name.lower():
+            return str(p.resolve())
+    for f in os.listdir():
+        if f.lower().endswith(".zip") and "arquetipo-reception" in f.lower():
+            return str(Path(f).resolve())
+    for f in os.listdir():
+        p = Path(f)
         if p.is_dir() and re.search(r"rec[-_].*customeridentity", p.name.lower()):
             return str(p.resolve())
     for f in os.listdir():
         if f.lower().endswith(".zip") and re.search(r"rec[-_].*customeridentity", f.lower()):
             return str(Path(f).resolve())
+    demo = "/mnt/data/arquetipo-reception.zip"
+    if os.path.exists(demo):
+        return demo
     return None
 
 def preparar_arquetipo_trabajo(arquetipo_path: str) -> Path:
@@ -333,6 +439,33 @@ Reglas:
 - No incluyas texto fuera del YAML.
 """
 
+PROMPT_APIGEE = """Eres un ingeniero de plataformas Apigee.
+Dado un OpenAPI (OAS) o descripción en texto, devuelve YAML válido con:
+
+api_display_name: nombre amigable (string)
+api_name: nombre del bundle/apiproxy en kebab-case (string)
+base_path: basePath del proxy, inicia con "/" (string, ej: "/reference-data")
+target_base_url: URL base del backend (string, ej: "https://backend.company.com/v1")
+products: lista de nombres de API Products sugeridos (lista de strings)
+quota:
+  enabled: true|false
+  interval: 1
+  timeUnit: minute|hour|day
+  limit: 60
+spike_arrest:
+  enabled: true|false
+  rate: "10ps"
+cors:
+  enabled: true|false
+auth:
+  type: "none|apikey|oauth2"
+notes: texto breve con supuestos
+
+Reglas:
+- api_name en kebab-case desde api_display_name.
+- No incluyas texto fuera del YAML.
+"""
+
 def _gpt(messages, temperature=0.2, model=MODEL_BASE) -> str:
     resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
     return resp.choices[0].message.content.strip()
@@ -364,6 +497,31 @@ def inferir_metadatos(contenido_api: str) -> dict:
         data["upstream_path"] = ("/"+base_path) if base_path else "/"
 
     return aplicar_perfil_por_capa(data)
+
+def inferir_metadatos_apigee(contenido_api: str) -> dict:
+    yml = _gpt([
+        {"role":"system","content":"Responde solo YAML válido."},
+        {"role":"user","content": PROMPT_APIGEE + "\n\n=== ESPECIFICACIÓN ===\n" + contenido_api}
+    ], temperature=0.1)
+    m = re.search(r"```(?:yaml|yml)?\s*(.*?)```", yml, re.DOTALL)
+    if m: yml = m.group(1).strip()
+    try:
+        data = yaml.safe_load(yml) or {}
+    except Exception:
+        data = {}
+    # Defaults
+    data.setdefault("api_display_name", "Reference Data")
+    if "api_name" not in data:
+        slug = re.sub(r"[^a-zA-Z0-9]+","-", data["api_display_name"]).strip("-").lower()
+        data["api_name"] = re.sub(r"-{2,}","-", slug or "reference-data")
+    data.setdefault("base_path", "/api")
+    data.setdefault("target_base_url", "https://backend.example.com")
+    data.setdefault("products", ["ref-data-basic"])
+    data.setdefault("quota", {"enabled": False})
+    data.setdefault("spike_arrest", {"enabled": False})
+    data.setdefault("cors", {"enabled": True})
+    data.setdefault("auth", {"type": "none"})
+    return data
 
 # ========= Perfil por capa =========
 
@@ -438,7 +596,7 @@ def postprocesar_xml(xml_text: str, ctx: dict) -> str:
     xml_text = insertar_o_actualizar_tls(xml_text, ctx)
     return xml_text
 
-# ========= Parsing RAML (para scaffold si hay RAML) =========
+# ========= Parsing RAML semilight =========
 
 HTTP_METHODS = {"get","post","put","delete","patch","head","options"}
 EXTRA_ACTIONS = {"retrieve","evaluate","execute","init","create","update","delete"}
@@ -492,7 +650,7 @@ def parse_raml_semilight(raml_text: str) -> dict:
             d["methods"].add("retrieve")
     return res
 
-# ========= Generadores XML =========
+# ========= Generadores XML Mule =========
 
 def _xml_header(apikit: bool=False):
     if apikit:
@@ -644,7 +802,7 @@ def common_global_config_xml(use_apikit: bool):
 {listener}
 {_xml_footer()}""".strip()
 
-# ========= Archivos base y helpers =========
+# ========= Archivos base Mule =========
 
 def ensure_dirs(root: Path):
     base = root / "src/main/mule"
@@ -688,16 +846,19 @@ def raml_classpath(root: Path) -> str|None:
     except Exception:
         return None
 
+# ========= Transformador con GPT (genérico) =========
+
 def transformar_archivo_con_gpt(fname: str, original: str, ctx: dict) -> str:
-    PROMPT_FILE = """Eres un configurador experto de proyectos Mule 4.
+    PROMPT_FILE = """Eres un configurador experto de proyectos Mule 4 / Apigee.
 Actualiza el archivo indicado usando METADATOS (YAML).
 
 Reglas:
 - Mantén formato/saltos.
 - No agregues explicaciones ni ``` .
-- Sustituye placeholders (groupId, artifactId, version, project.mule.name,
+- Sustituye placeholders relevantes (groupId, artifactId, version, project.mule.name,
   http listener path/port, http request host/protocol/path, exchange.json main/assetId/groupId/name/version,
-  y propiedades YAML app/general/upstream).
+  properties YAML, nombre de apiproxy, basePath, TargetEndpoint URL, políticas (si aplican),
+  CORS/spike-arrest/quota/apikey/headers en Apigee).
 - Si un valor del contexto es null, no lo inventes.
 - No borres secciones no relacionadas.
 
@@ -709,15 +870,17 @@ Reglas:
 """
     ctx_yaml = yaml.safe_dump(ctx, sort_keys=False, allow_unicode=True)
     raw = _gpt([
-        {"role":"system","content":"Actúa como refactorizador determinista de archivos Mule/Java/XML/YAML/JSON."},
+        {"role":"system","content":"Actúa como refactorizador determinista de archivos Mule/Apigee/XML/YAML/JSON/JS/properties."},
         {"role":"user","content": PROMPT_FILE.format(ctx_yaml=ctx_yaml, fname=fname, original=original)}
     ], temperature=0.1)
 
-    blocks = re.findall(r"```(?:xml|yaml|yml|json|properties|txt)?\s*(.*?)```", raw, re.DOTALL)
+    blocks = re.findall(r"```(?:xml|yaml|yml|json|properties|txt|js)?\s*(.*?)```", raw, re.DOTALL)
     contenido = (blocks[-1].strip() if blocks else raw.strip())
     if not contenido or len(contenido.splitlines()) < max(3, int(len(original.splitlines())*0.3)):
         return original
     return contenido
+
+# ========= POM ajustes =========
 
 def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool):
     pom_path = root_dir / "pom.xml"
@@ -778,7 +941,7 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool):
             ET.SubElement(d, q("version")).text = "1.11.0"
             ET.SubElement(d, q("classifier")).text = "mule-plugin"
 
-# ========= README, MUnit y script de validación =========
+# ========= README / scripts (Mule) =========
 
 def write_readme(root: Path, raml_info: dict, ctx: dict, service_type: str, spec_kind: str | None):
     readme = root / "README.md"
@@ -829,8 +992,8 @@ def write_readme(root: Path, raml_info: dict, ctx: dict, service_type: str, spec
         lines += [
             "",
             "## Nota REC / OAS",
-            "- Se copió el archivo OpenAPI a `src/main/resources/api/openapi.yaml` (genérico) o a la ruta del arquetipo Reception cuando aplica.",
-            "- No se genera APIkit; usa tu estrategia (Router, Custom flows, etc.)."
+            "- Se copió el archivo OpenAPI a `src/main/apigee/.../resources/oas/rec-reference-data.json` (layout Reception) o a `src/main/resources/api/openapi.yaml` (layout genérico).",
+            "- La generación Apigee ajusta proxies, targets, políticas y JS según metadatos."
         ]
     readme.write_text("\n".join(lines)+"\n", encoding="utf-8")
 
@@ -883,7 +1046,7 @@ def write_munit_min(root: Path, raml_info: dict):
 """
             (tests_dir / name).write_text(xml, encoding="utf-8")
 
-# ========= RÚBRICAS: carga automática & evaluación =========
+# ========= RÚBRICAS =========
 
 def _normalize_rubric_item(item: dict) -> dict:
     return {
@@ -897,28 +1060,29 @@ def _normalize_rubric_item(item: dict) -> dict:
         "enabled": item.get("enabled", True),
     }
 
-def _load_rubrics_from_root() -> list[dict]:
-    path = Path("Rubrics_Generation_Mule.json")
+def _load_rubrics_from_root(filename: str, kind_label: str) -> list[dict]:
+    path = Path(filename)
     if not path.exists():
-        st.sidebar.warning("⚠️ No se encontró Rubrics_Generation_Mule.json en la raíz del proyecto. Se aplicarán solo validaciones básicas.")
+        st.sidebar.warning(f"⚠️ No se encontró {filename} en la raíz. Se aplicarán solo validaciones básicas ({kind_label}).")
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         arr = data.get("rubrics", data)
         if isinstance(arr, dict): arr = [arr]
         rubrics = [_normalize_rubric_item(x) for x in arr if isinstance(x, dict)]
-        st.sidebar.success(f"✅ Rúbricas cargadas automáticamente ({len(rubrics)} definiciones).")
+        st.sidebar.success(f"✅ Rúbricas ({kind_label}) cargadas automáticamente ({len(rubrics)} definiciones).")
         return rubrics
     except Exception as e:
-        st.sidebar.error(f"❌ Error al cargar rúbricas: {e}")
+        st.sidebar.error(f"❌ Error al cargar rúbricas {filename}: {e}")
         return []
 
+# Carga inicial (por defecto asume Mule)
 if not st.session_state.rubrics_defs:
-    st.session_state.rubrics_defs = _load_rubrics_from_root()
+    st.session_state.rubrics_defs = _load_rubrics_from_root("Rubrics_Generation_Mule.json", "Mule")
+    st.session_state.rubrics_kind = "mule"
 
 def apply_rubrics_observations(root: Path, use_apikit: bool, raml_info: dict, base_notes: list[str]) -> list[str]:
     items = [r for r in st.session_state.rubrics_defs if r.get("enabled", True)]
-
     keywords_map = [
         ("carpeta", ["Estructura","carpeta","folder","estructura"]),
         ("XML sueltos", ["XML sueltos","suelto","mover a subcarpetas"]),
@@ -927,7 +1091,13 @@ def apply_rubrics_observations(root: Path, use_apikit: bool, raml_info: dict, ba
         ("application.properties", ["application.properties"]),
         ("listener", ["listener-config","global-httpListener","Listener"]),
         ("error handler", ["common-error-handler","hdl_commonErrorHandler","error handler"]),
-        ("naming", ["Naming","-client.xml","-handler.xml","-orchestrator.xml"])
+        ("naming", ["Naming","-client.xml","-handler.xml","-orchestrator.xml"]),
+        ("apiproxy", ["apiproxy","proxies","targets","policies"]),
+        ("oas", ["openapi","oas","rec-reference-data.json"]),
+        ("quota", ["Quota","cuota"]),
+        ("spike", ["SpikeArrest","Spike-Arrest","spike-arrest"]),
+        ("cors", ["CORS","cors"]),
+        ("apikey", ["verifyapikey","apikey","api key"]),
     ]
 
     def guess_rubric_for_note(note: str) -> dict | None:
@@ -971,23 +1141,20 @@ def apply_rubrics_observations(root: Path, use_apikit: bool, raml_info: dict, ba
         if not r.get("enabled", True):
             continue
         sev = (r.get("severity") or "WARN").upper()
-        if sev not in ("CRIT","WARN"):  # solo lo crítico/advertencia
+        if sev not in ("CRIT","WARN"):
             continue
         rid = r.get("id") or ""
         if rid and rid in shown_ids:
             continue
-        if "apikit" in r.get("label","").lower() and not use_apikit:
-            continue
         if r.get("label"):
             pendents.append(f"<span class='sev-{sev}'><b>[{sev}]</b></span> ({rid}) [Rúbrica] {r.get('label')} — pendiente de verificación automática")
 
-    pendents = pendents[:12]
-    return adorned + pendents
+    return adorned + pendents[:12]
 
-def rubric_observaciones_basic(root: Path, use_apikit: bool, raml_info: dict):
+# ---- Observaciones Mule básicas
+def rubric_observaciones_basic_mule(root: Path, use_apikit: bool, raml_info: dict):
     notes = []
     base = root / "src/main/mule"
-
     required_dirs = ["client","handler","orchestrator","common"]
     for d in required_dirs:
         if not (base/d).exists():
@@ -1035,17 +1202,41 @@ def rubric_observaciones_basic(root: Path, use_apikit: bool, raml_info: dict):
 
     return notes
 
-def rubric_observaciones(root: Path, use_apikit: bool, raml_info: dict):
-    base_notes = rubric_observaciones_basic(root, use_apikit, raml_info)
-    if st.session_state.rubrics_defs:
-        def rubric_observaciones(root: Path, use_apikit: bool, raml_info: dict):
-            """Wrapper que integra rúbricas (si están habilitadas) sobre las observaciones básicas."""
-            base_notes = rubric_observaciones_basic(root, use_apikit, raml_info)
-            if st.session_state.rubrics_defs:
-                return apply_rubrics_observations(root, use_apikit, raml_info, base_notes)
-            return base_notes
+# ---- Observaciones Apigee básicas
+def rubric_observaciones_basic_apigee(root: Path):
+    notes = []
+    base = root / "src/main/apigee/apiproxies"
+    # Buscar apiproxy
+    apiproxy_dirs = list(base.glob("*/apiproxy"))
+    if not apiproxy_dirs:
+        notes.append("[Apigee] No se encontró apiproxy bajo src/main/apigee/apiproxies/*/apiproxy")
+        return notes
+    apidir = apiproxy_dirs[0]
+    if not (apidir/"proxies/default.xml").exists():
+        notes.append("[Apigee] Falta proxies/default.xml")
+    if not (apidir/"targets/backend.xml").exists():
+        notes.append("[Apigee] Falta targets/backend.xml")
+    if not (apidir/"resources/oas").exists():
+        notes.append("[Apigee] Falta carpeta resources/oas con OAS")
+    pols = list((apidir/"policies").glob("*.xml"))
+    if not pols:
+        notes.append("[Apigee] No hay políticas en policies/*.xml (se esperan VerifyAPIKey/SpikeArrest/Quota/AssignMessage/etc)")
+    # Naming sugerido
+    bundle_name = apidir.parent.name
+    if not re.match(r"^[A-Za-z0-9._-]+$", bundle_name):
+        notes.append(f"[Naming] Nombre de bundle apiproxy '{bundle_name}' contiene caracteres no recomendados")
+    return notes
 
-  # ========= LOGGING A DATADOG =========
+def rubric_observaciones(root: Path, use_apikit: bool, raml_info: dict, mode: str):
+    if mode == "apigee":
+        base_notes = rubric_observaciones_basic_apigee(root)
+    else:
+        base_notes = rubric_observaciones_basic_mule(root, use_apikit, raml_info)
+    if st.session_state.rubrics_defs:
+        return apply_rubrics_observations(root, use_apikit, raml_info, base_notes)
+    return base_notes
+
+# ========= LOGGING A DATADOG =========
 
 def _backup_log_locally(payload: dict):
     try:
@@ -1057,19 +1248,12 @@ def _backup_log_locally(payload: dict):
         pass  # no bloqueante
 
 def send_chatlog_to_datadog(event: dict):
-    """
-    Envía un único evento de log a Datadog (HTTP intake v2).
-    Si no hay API key, guarda respaldo local y retorna.
-    """
     _backup_log_locally(event)
     if not DD_API_KEY:
         st.sidebar.warning("⚠️ DATADOG_API_KEY no configurada. Log guardado localmente en ./logs/")
         return
 
-    headers = {
-        "Content-Type": "application/json",
-        "DD-API-KEY": DD_API_KEY,
-    }
+    headers = {"Content-Type": "application/json", "DD-API-KEY": DD_API_KEY}
     body = [{
         "ddsource": DD_SOURCE,
         "service": DD_SERVICE,
@@ -1089,26 +1273,12 @@ def send_chatlog_to_datadog(event: dict):
     except Exception as e:
         st.sidebar.error(f"Datadog log error: {e}")
 
-# ========= Proceso principal =========
+# ========= PROCESOS DE GENERACIÓN =========
 
-def common_error_handler_xml():
-    header = _xml_header(False)
-    return f"""{header}
-  <!-- common error handler -->
-  <sub-flow name="hdl_commonErrorHandler">
-    <logger level="ERROR" message="type=#[error.errorType] desc=#[error.description]"/>
-  </sub-flow>
-{_xml_footer()}""".strip()
-
-def write_readme(root: Path, raml_info: dict, ctx: dict, service_type: str, spec_kind: str | None):
-    # (definida arriba; se mantiene)
-    pass  # placeholder para evitar redefinición accidental
-
-def procesar_arquetipo_llm(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|None, use_reception_layout: bool = False):
+def procesar_arquetipo_mule(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|None, spec_kind: str):
     src = Path(arquetipo_dir)
     tmp_dir = Path(tempfile.mkdtemp())
     shutil.copytree(src, tmp_dir, dirs_exist_ok=True)
-
     roots = [p for p in tmp_dir.iterdir() if p.is_dir()]
     root = roots[0] if len(roots)==1 else tmp_dir
 
@@ -1131,10 +1301,8 @@ def procesar_arquetipo_llm(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|None
             if path.suffix.lower() in TEXT_EXTS or path.name.lower()=="pom.xml":
                 original = path.read_text(encoding="utf-8", errors="ignore")
                 nuevo = transformar_archivo_con_gpt(path.name, original, ctx)
-
                 if path.suffix.lower() == ".xml":
                     nuevo = postprocesar_xml(nuevo, ctx)
-
                 ext = path.suffix.lower()
                 if path.name.lower()=="pom.xml" or ext==".xml":
                     err = validar_xml(nuevo, path.name)
@@ -1142,7 +1310,6 @@ def procesar_arquetipo_llm(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|None
                 elif ext in (".yaml",".yml"):
                     err = validar_yaml(nuevo, path.name)
                     if err: nuevo = original
-
                 path.write_text(nuevo, encoding="utf-8")
         except Exception:
             pass
@@ -1150,7 +1317,6 @@ def procesar_arquetipo_llm(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|None
     raml_info = {}
     raml_cp_value = None
     service_type = st.session_state.get("service_type","UNKNOWN")
-    spec_kind = st.session_state.get("spec_kind")
 
     if spec_bytes:
         if spec_kind == "RAML":
@@ -1165,25 +1331,11 @@ def procesar_arquetipo_llm(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|None
                 raml_info = {}
             if service_type not in ("PROXY","REC"):
                 raml_cp_value = raml_classpath(root)
-
         elif spec_kind == "OAS":
-            if use_reception_layout:
-                oas_path = root / "src/main/apigee/apiproxies/referenceData/apiproxy/resources/oas/rec-reference-data.json"
-                oas_path.parent.mkdir(parents=True, exist_ok=True)
-                upname = (st.session_state.get("spec_name") or "").lower()
-                try:
-                    if upname.endswith((".yaml", ".yml")):
-                        data_oas = yaml.safe_load(spec_bytes.decode("utf-8","ignore"))
-                        oas_path.write_text(json.dumps(data_oas, ensure_ascii=False, indent=2), encoding="utf-8")
-                    else:
-                        oas_path.write_bytes(spec_bytes)
-                except Exception:
-                    oas_path.write_bytes(spec_bytes)
-            else:
-                target = oas_target(root)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with open(target, "wb") as f:
-                    f.write(spec_bytes)
+            target = oas_target(root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(target, "wb") as f:
+                f.write(spec_bytes)
 
     base = root / "src/main/mule"
     client_dir = base / "client"
@@ -1209,23 +1361,19 @@ def procesar_arquetipo_llm(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|None
         if raml_info and service_type not in ("PROXY","REC"):
             for recurso, data in sorted(raml_info.items()):
                 methods = data.get("methods") or {"retrieve"}
-
                 rname = safe_filename(recurso, "root")
-
                 c_path = client_dir / f"{rname}-client.xml"
                 if not c_path.exists():
                     xml = client_file_xml(rname, methods, ctx.get("general_path","/api/*"), use_apikit, raml_cp_value)
                     try: ET.fromstring(xml)
                     except ET.ParseError: xml = f"<mule><flow name='{rname}_client_main'/></mule>"
                     c_path.write_text(xml, encoding="utf-8")
-
                 h_path = handler_dir / f"{rname}-handler.xml"
                 if not h_path.exists():
                     xml = handler_file_xml(rname, methods, raml_info)
                     try: ET.fromstring(xml)
                     except ET.ParseError: xml = f"<mule><flow name='{rname}_handler_main'/></mule>"
                     h_path.write_text(xml, encoding="utf-8")
-
                 if len(methods) == 1:
                     o_path = orch_dir / f"{rname}-orchestrator.xml"
                     if not o_path.exists():
@@ -1243,27 +1391,100 @@ def procesar_arquetipo_llm(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|None
                             o_path.write_text(xml, encoding="utf-8")
 
     enforce_pom_requirements(root, ctx, use_apikit=False if service_type in ("PROXY","REC") else bool(raml_cp_value))
-
-    # README, script, MUnit
     write_readme(root, raml_info, ctx, service_type, spec_kind)
     write_validate_script(root)
     if raml_info and service_type not in ("PROXY","REC"):
         write_munit_min(root, raml_info)
 
-    notes = rubric_observaciones(root, use_apikit=False if service_type in ("PROXY","REC") else bool(raml_cp_value), raml_info=raml_info)
+    notes = rubric_observaciones(root, use_apikit=False if service_type in ("PROXY","REC") else bool(raml_cp_value), raml_info=raml_info, mode="mule")
     st.session_state.observaciones = notes
 
-    # Nombre ZIP = nombre del archivo cargado (sin extensión)
     spec_base = Path(st.session_state.get("spec_name") or "proyecto").stem
     out_name = f"{spec_base}.zip"
     out_zip = Path(tempfile.gettempdir()) / out_name
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for p in root.rglob("*"):
             z.write(p, p.relative_to(root))
-
     return str(out_zip)
 
-# === NUEVO: ejecución encapsulada de la generación (bloquea input) ===
+def procesar_arquetipo_apigee(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|None, spec_name: str, spec_kind: str):
+    """
+    Reescribe el arquetipo Reception (Apigee) con metadatos de ChatGPT:
+    - proxies/default.xml (BasePath)
+    - targets/backend.xml (URL)
+    - policies/*.xml (Quota/Spike/CORS/VerifyAPIKey/AssignMessage etc., si aplican)
+    - resources/jsc/*.js (ajustes menores)
+    - resources/oas (coloca OAS del usuario)
+    """
+    src = Path(arquetipo_dir)
+    tmp_dir = Path(tempfile.mkdtemp())
+    shutil.copytree(src, tmp_dir, dirs_exist_ok=True)
+    roots = [p for p in tmp_dir.rglob("apiproxy") if p.is_dir()]
+    root = tmp_dir  # raíz del proyecto generado
+
+    apiproxy_dir = roots[0] if roots else None
+    if not apiproxy_dir:
+        # buscar estructura legacy
+        maybe = list(tmp_dir.rglob("*/apiproxy"))
+        if maybe:
+            apiproxy_dir = maybe[0]
+        else:
+            raise RuntimeError("No se encontró carpeta 'apiproxy' en el arquetipo Reception")
+
+    # Colocar OAS
+    oas_dir = apiproxy_dir / "resources" / "oas"
+    oas_dir.mkdir(parents=True, exist_ok=True)
+    oas_target = oas_dir / "rec-reference-data.json"
+    if spec_bytes:
+        try:
+            if spec_kind in ("OAS",) and (spec_name.lower().endswith((".yaml",".yml"))):
+                data_oas = yaml.safe_load(spec_bytes.decode("utf-8","ignore"))
+                oas_target.write_text(json.dumps(data_oas, ensure_ascii=False, indent=2), encoding="utf-8")
+            else:
+                oas_target.write_bytes(spec_bytes)
+        except Exception:
+            oas_target.write_bytes(spec_bytes)
+
+    # Transformar archivos clave con GPT
+    files_to_touch = []
+    for p in apiproxy_dir.rglob("*"):
+        if p.is_file() and (p.suffix.lower() in TEXT_EXTS or p.suffix.lower() in {".xml",".js"}):
+            files_to_touch.append(p)
+
+    prog = st.progress(0.0)
+    total = len(files_to_touch)
+    for i, path in enumerate(files_to_touch, 1):
+        prog.progress(i/total)
+        try:
+            original = path.read_text(encoding="utf-8", errors="ignore")
+            nuevo = transformar_archivo_con_gpt(str(path.relative_to(apiproxy_dir)), original, ctx)
+            if path.suffix.lower() == ".xml":
+                err = validar_xml(nuevo, path.name)
+                if err:
+                    # Si rompe, mantenemos original para no dañar bundle
+                    nuevo = original
+            elif path.suffix.lower() in (".yaml",".yml"):
+                err = validar_yaml(nuevo, path.name)
+                if err:
+                    nuevo = original
+            path.write_text(nuevo, encoding="utf-8")
+        except Exception:
+            pass
+
+    # Observaciones Apigee
+    notes = rubric_observaciones(root, use_apikit=False, raml_info={}, mode="apigee")
+    st.session_state.observaciones = notes
+
+    # ZIP final
+    spec_base = Path(spec_name or ctx.get("api_name","reference-data")).stem
+    out_name = f"{spec_base}.zip"
+    out_zip = Path(tempfile.gettempdir()) / out_name
+    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in root.rglob("*"):
+            z.write(p, p.relative_to(root))
+    return str(out_zip)
+
+# === NUEVO: ejecución encapsulada de la generación ===
 def ejecutar_generacion():
     try:
         if not st.session_state.uploaded_spec:
@@ -1276,15 +1497,24 @@ def ejecutar_generacion():
         choice = st.session_state.get("archetype_choice", "Automático")
         svc = st.session_state.get("service_type", "UNKNOWN")
 
+        # Si es Reception → Apigee
         if choice == "Reception" or (choice == "Automático" and svc == "REC"):
+            # Cargar rúbricas de Apigee
+            st.session_state.rubrics_defs = _load_rubrics_from_root("Rubricas_Scaffold_Apigee.json", "Apigee")
+            st.session_state.rubrics_kind = "apigee"
+
             arquetipo = obtener_arquetipo_reception()
             if not arquetipo:
-                st.session_state.messages.append({"role":"assistant","content":"❌ No encontré el ZIP/carpeta Reception (Rec-Ref-Data-CustomerIdentity) en la raíz."})
+                st.session_state.messages.append({"role":"assistant","content":"❌ No encontré el ZIP/carpeta Reception (arquetipo-reception) en la raíz."})
                 st.session_state.is_generating = False
                 st.session_state.pending_action = None
                 return
             use_reception_layout = True
         else:
+            # Cargar rúbricas Mule (por si veníamos de Apigee)
+            st.session_state.rubrics_defs = _load_rubrics_from_root("Rubrics_Generation_Mule.json", "Mule")
+            st.session_state.rubrics_kind = "mule"
+
             arquetipo = obtener_arquetipo_generic()
             if not arquetipo:
                 st.session_state.messages.append({"role":"assistant","content":"❌ No encontré el arquetipo genérico (ZIP/carpeta con 'arquetipo') en la raíz."})
@@ -1293,42 +1523,81 @@ def ejecutar_generacion():
                 return
             use_reception_layout = False
 
+        # Leer espec y construir contexto LLM
         st.session_state.messages.append({"role":"assistant","content":"🧠 Leyendo especificación y construyendo contexto con ChatGPT..."})
-        raw = leer_especificacion(st.session_state.uploaded_spec)
-        ctx = inferir_metadatos(raw)
+        # === Leer especificación del usuario y preparar contexto ===
+        st.session_state.messages.append(
+            {"role": "assistant", "content": "🧠 Leyendo especificación y construyendo contexto con ChatGPT..."})
 
-        # 🔧 Forzar nombre de proyecto/artifact a partir del archivo cargado
-        base_name = Path(st.session_state.get("spec_name") or "MuleApplication").stem
-        slug = re.sub(r"[^a-zA-Z0-9]+","-", base_name).strip("-").lower()
-        slug = re.sub(r"-{2,}","-", slug) or "mule-application"
-        ctx["project_name"] = base_name
-        ctx["artifact_id"] = slug
+        raw_ctx = st.session_state.get("ctx_text")
+        if not raw_ctx:
+            raw_ctx = leer_especificacion(st.session_state.uploaded_spec)
 
-        st.session_state.messages.append({"role":"assistant","content":f"🧾 Metadatos:\n```yaml\n{yaml.safe_dump(ctx,sort_keys=False,allow_unicode=True)}\n```"})
+        # Selección de rubricas (mostrar de inmediato también en UI principal)
+        choice = st.session_state.get("archetype_choice", "Automático")
+        svc = st.session_state.get("service_type", "UNKNOWN")
+        use_reception_layout = (choice == "Reception" or (choice == "Automático" and svc == "REC"))
 
-        st.session_state.uploaded_spec.seek(0)
-        spec_bytes = st.session_state.uploaded_spec.read()
+        if use_reception_layout:
+            if st.session_state.get("rubrics_kind") != "apigee":
+                st.session_state.rubrics_defs = _load_rubrics_from_root("Rubricas_Scaffold_Apigee.json", "Apigee")
+                st.session_state.rubrics_kind = "apigee"
+        else:
+            if st.session_state.get("rubrics_kind") != "mule":
+                st.session_state.rubrics_defs = _load_rubrics_from_root("Rubrics_Generation_Mule.json", "Mule")
+                st.session_state.rubrics_kind = "mule"
+
+        # Inferencia de metadatos con el contexto ya armado
+        if use_reception_layout:
+            apigee_ctx = inferir_metadatos_apigee(raw_ctx or "")
+            base_name = Path(st.session_state.get("spec_name") or apigee_ctx.get("api_name", "reference-data")).stem
+            apigee_ctx["api_display_name"] = apigee_ctx.get("api_display_name") or base_name
+            apigee_ctx["api_name"] = re.sub(r"-{2,}", "-", re.sub(r"[^a-zA-Z0-9]+", "-", base_name).strip("-").lower())
+            ctx = apigee_ctx
+        else:
+            mule_ctx = inferir_metadatos(raw_ctx or "")
+            base_name = Path(st.session_state.get("spec_name") or "MuleApplication").stem
+            slug = re.sub(r"[^a-zA-Z0-9]+", "-", base_name).strip("-").lower()
+            slug = re.sub(r"-{2,}", "-", slug) or "mule-application"
+            mule_ctx["project_name"] = base_name
+            mule_ctx["artifact_id"] = slug
+            ctx = mule_ctx
+
+        st.session_state.messages.append({"role": "assistant",
+                                          "content": f"🧾 Metadatos:\n```yaml\n{yaml.safe_dump(ctx, sort_keys=False, allow_unicode=True)}\n```"})
+
+        # bytes reales de especificación a inyectar en el proyecto
+        spec_kind_effective = st.session_state.get("extracted_kind") or st.session_state.get("spec_kind")
+        spec_bytes = st.session_state.get("extracted_bytes")
+        if not spec_bytes:
+            st.session_state.uploaded_spec.seek(0)
+            spec_bytes = st.session_state.uploaded_spec.read()
 
         work_src = preparar_arquetipo_trabajo(arquetipo)
 
-        st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo arquetipo / PROXY / OAS + POM + README + MUnit + observaciones..."})
         start_ts = time.time()
-        salida_zip = procesar_arquetipo_llm(str(work_src), ctx, spec_bytes, use_reception_layout=use_reception_layout)
+        if use_reception_layout:
+            st.session_state.messages.append({"role":"assistant","content":"⚙️ Generando bundle Apigee (Reception): proxies/targets/policies/resources..."})
+            salida_zip = procesar_arquetipo_apigee(str(work_src), ctx, spec_bytes, st.session_state.get("spec_name"), st.session_state.get("spec_kind"))
+            label = "RECEPTION"
+        else:
+            st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo arquetipo Mule: POM + XML + README + MUnit + observaciones..."})
+            salida_zip = procesar_arquetipo_mule(str(work_src), ctx, spec_bytes, st.session_state.get("spec_kind"))
+            tipo = st.session_state.get("service_type","UNKNOWN")
+            label = TYPE_LABELS.get(tipo, tipo)
+
         end_ts = time.time()
         st.session_state.generated_zip = salida_zip
 
-        tipo = st.session_state.get("service_type","UNKNOWN")
-        label = TYPE_LABELS.get(tipo, tipo)
         resumen = f"✅ Proyecto generado. Tipo detectado: **{label}**."
         if st.session_state.observaciones:
-            resumen += f"\n⚠️ Observaciones: {len(st.session_state.observaciones)} (con rúbricas)"
+            resumen += f"\n⚠️ Observaciones: {len(st.session_state.observaciones)} (con rúbricas: {st.session_state.rubrics_kind})"
         st.session_state.messages.append({"role":"assistant","content":resumen})
-        st.info(f"🔎 La API es de tipo **{label}**")
+        st.info(f"🔎 Tipo de API: **{label}**")
 
         # 📤 Enviar log a Datadog
-        spec_base = Path(st.session_state.get("spec_name") or "proyecto").stem
         dd_event = {
-            "event": "mule_project_generation",
+            "event": "mule_project_generation" if not use_reception_layout else "apigee_project_generation",
             "service_type": label,
             "archetype_choice": st.session_state.get("archetype_choice"),
             "spec_name": st.session_state.get("spec_name"),
@@ -1336,6 +1605,7 @@ def ejecutar_generacion():
             "output_zip": Path(salida_zip).name,
             "observations_count": len(st.session_state.get("observaciones", [])),
             "rubrics_count": len(st.session_state.get("rubrics_defs", [])),
+            "rubrics_kind": st.session_state.get("rubrics_kind"),
             "metadatos": ctx,
             "chat_history": st.session_state.get("messages", []),
             "started_at": datetime.datetime.utcfromtimestamp(start_ts).isoformat()+"Z",
@@ -1367,35 +1637,35 @@ def manejar_mensaje(user_input: str):
         if not st.session_state.uploaded_spec:
             st.session_state.messages.append({"role":"assistant","content":"⚠️ Primero adjunta un RAML, OAS (.yaml/.json) o DTM (.docx)."})
             return
-
         st.session_state.is_generating = True
         st.session_state.pending_action = "generate"
         st.session_state.messages.append({"role":"assistant","content":"⏳ Iniciando generación... la entrada quedará deshabilitada hasta finalizar."})
         st.rerun()
         return
     else:
-        st.session_state.messages.append({"role":"assistant","content":"💬 Escribe `crea el proyecto` para generar el zip a partir de tu especificación."})
+        st.session_state.messages.append({"role":"assistant","content":"💬 Escribe \"crea el proyecto\" para generar el zip a partir de tu especificación."})
 
 # ========= Upload =========
 
 spec = st.file_uploader(
-    "Adjunta la especificación (RAML, OAS .yaml/.json o DTM .docx)",
-    type=["raml","yaml","yml","json","docx"]
+    "Adjunta el ZIP de diseño (api-dom o api-rec)",
+    type=["zip"]
 )
 if spec and st.session_state.uploaded_spec is None:
     st.session_state.uploaded_spec = spec
     st.session_state.spec_name = spec.name
     stype = _map_prefix_to_type(spec.name)
     st.session_state.service_type = stype if stype else "UNKNOWN"
+    # Pre-parse: deja ctx_text y extracted_* listos
     leer_especificacion(spec)
     st.session_state.messages.append({
-        "role":"assistant",
-        "content":f"📄 Archivo \"{spec.name}\" cargado. Escribe **crea el proyecto**."
+        "role": "assistant",
+        "content": f"📦 Especificación \"{spec.name}\" cargada. Escribe \"crea el proyecto\"."
     })
 
 # === Selector de arquetipo (auto / reception / genérico) ===
 if st.session_state.get("uploaded_spec"):
-    choices = ["Automático", "Reception (Rec-Ref-Data-CustomerIdentity)", "Genérico"]
+    choices = ["Domain", "Reception", "Business"]
     default_idx = 0
     if st.session_state.get("service_type") == "REC":
         default_idx = 0
@@ -1424,12 +1694,9 @@ if st.session_state.get("observaciones"):
     for o in st.session_state.observaciones:
         st.markdown(f"- {o}", unsafe_allow_html=True)
 
-# === Oculta cualquier chat_input del DOM si hay generación ===
+# === Oculta chat_input si hay generación ===
 if st.session_state.get("is_generating", False):
-    st.markdown(
-        "<style>div[data-testid='stChatInput']{display:none !important}</style>",
-        unsafe_allow_html=True
-    )
+    st.markdown("<style>div[data-testid='stChatInput']{display:none !important}</style>", unsafe_allow_html=True)
 
 # === Si hay generación pendiente, ejecutarla ===
 if st.session_state.is_generating and st.session_state.pending_action == "generate":
@@ -1437,9 +1704,8 @@ if st.session_state.is_generating and st.session_state.pending_action == "genera
         ejecutar_generacion()
     st.rerun()
 
-# ====== Entrada chat (único contenedor) ======
+# ====== Entrada chat ======
 chat_area = st.empty()
-
 if st.session_state.get("is_generating", False):
     with chat_area:
         st.markdown(
@@ -1459,7 +1725,8 @@ else:
 # ====== Descarga ======
 if st.session_state.generated_zip:
     tipo = st.session_state.get("service_type","UNKNOWN")
-    st.info(f"🔎 La API es de tipo **{TYPE_LABELS.get(tipo, tipo)}**")
+    label = "RECEPTION" if (st.session_state.get("archetype_choice")=="Reception" or tipo=="REC") else TYPE_LABELS.get(tipo, tipo)
+    st.info(f"🔎 La API es de tipo **{label}**")
 
     with open(st.session_state.generated_zip, "rb") as f:
         st.download_button("⬇️ Descargar Proyecto (.zip)", f,
