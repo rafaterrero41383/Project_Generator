@@ -5,20 +5,15 @@ import io
 import os
 import sys
 import types
-import socket
-import datetime
-import time
-import json
-import requests
+import zipfile
+import re
 import streamlit as st
 from dotenv import load_dotenv
 from pathlib import Path
 import tempfile
 import shutil
-import zipfile
-import re
 
-# --- Parche compatibilidad 3.13 (si es necesario) ---
+# --- Parche compatibilidad ---
 if 'imghdr' not in sys.modules:
     imghdr = types.ModuleType("imghdr")
     sys.modules['imghdr'] = imghdr
@@ -27,9 +22,8 @@ if 'imghdr' not in sys.modules:
 from constants import *
 from llm_service import inferir_contexto_unificado
 from project_generator import procesar_arquetipo
-
-# Asumimos que otras funciones de utilidad (lectura de zip, etc.) están en un archivo utils.py
-# Por simplicidad en esta refactorización, las incluimos aquí.
+# <<< NUEVO >>> Importamos el nuevo servicio de rúbricas
+from rubrics_service import cargar_rubricas, analizar_proyecto_con_rubricas
 
 # ========= CONFIG =========
 load_dotenv()
@@ -37,19 +31,21 @@ if not os.getenv("OPENAI_API_KEY"):
     st.error("❌ Falta OPENAI_API_KEY en secretos/entorno.")
     st.stop()
 
-# Datadog (opcional)
-DD_API_KEY = os.getenv("DATADOG_API_KEY")
-DD_SITE = os.getenv("DATADOG_SITE", "datadoghq.com")
-DD_URL = f"https://http-intake.logs.{DD_SITE}/api/v2/logs"
-DD_SERVICE = os.getenv("DATADOG_SERVICE", "mule-project-generator")
-DD_SOURCE = os.getenv("DATADOG_SOURCE", "mulesoft-gen")
-DD_TAGS = os.getenv("DATADOG_TAGS", "app:mule-gen,env:local")
-
 # ========= UI & Estado =========
 st.set_page_config(page_title="🤖 Generador de Proyectos", layout="wide")
 st.markdown("""
 <style>
-/* ... (tu CSS aquí) ... */
+/* ... (tu CSS aquí, asegúrate de incluir las clases sev-CRIT, sev-WARN, etc.) ... */
+#MainMenu { display:none }
+.chat-message { display:flex; align-items:flex-start; gap:12px; margin-bottom:14px; }
+.user-message { flex-direction: row-reverse; }
+.avatar { width: 36px; height: 36px; border-radius: 50%; object-fit: cover; }
+.message-bubble { padding: 12px 14px; border-radius: 14px; max-width: 85%; line-height:1.38; }
+.user-bubble { background:#e3f2fd; border:1px solid #bbdefb; }
+.assistant-bubble { background:#f1f0f0; border:1px solid #ddd; }
+.sev-CRIT { color:#b71c1c; }
+.sev-WARN { color:#e65100; }
+.sev-INFO { color:#1565c0; }
 </style>
 """, unsafe_allow_html=True)
 st.markdown("<h1 style='text-align:center;'>🤖 Generador de Proyectos</h1>", unsafe_allow_html=True)
@@ -72,8 +68,8 @@ def init_session_state():
 init_session_state()
 
 
-# ========= Utilidades (movidas de `utils.py` para simplicidad) =========
-
+# ========= Utilidades =========
+# (Las funciones _map_prefix_to_type, _best_candidate_from_zip, leer_especificacion, etc. van aquí)
 def _map_prefix_to_type(filename: str) -> str | None:
     if not filename: return None
     fname = filename.lower()
@@ -110,13 +106,9 @@ def leer_especificacion(file):
         st.session_state[S_EXTRACTED_BYTES] = inner_bytes
         ctx_text = inner_bytes.decode("utf-8", "ignore")
         st.session_state[S_CTX_TEXT] = ctx_text
-    # ... (añadir lógica para otros tipos si es necesario)
 
 
-# --- Lógica de Arquetipos (simplificada) ---
-# En una app real, esto estaría en `archetype_manager.py`
 def obtener_arquetipo(layer: str) -> str | None:
-    # Busca un arquetipo localmente (ej. ./archetypes/reception, ./archetypes/generic-mule)
     archetype_path = Path("archetypes") / layer
     if archetype_path.exists() and archetype_path.is_dir():
         return str(archetype_path.resolve())
@@ -139,44 +131,56 @@ def ejecutar_generacion():
 
         st.info(f"⚙️ Iniciando generación para la capa: **{choice}**")
 
-        # 1. Obtener el contexto del LLM (una sola llamada)
         with st.spinner("🧠 Analizando especificación con IA..."):
-            contexto = inferir_contexto_unificado(
-                st.session_state[S_CTX_TEXT],
-                choice
-            )
+            contexto = inferir_contexto_unificado(st.session_state[S_CTX_TEXT], choice)
 
         if not contexto:
-            st.error("❌ El LLM no pudo generar un contexto válido. Revisa el log o la especificación.")
+            st.error("❌ El LLM no pudo generar un contexto válido.")
             return
 
         st.success("✅ Contexto de generación creado con éxito.")
-        with st.expander("Ver YAML de contexto generado"):
-            st.code(contexto.json(indent=2), language="json")
+        with st.expander("Ver contexto generado"):
+            st.json(contexto.model_dump())
 
-        # 2. Encontrar el arquetipo-plantilla correcto
         layer_key = choice.lower()
+        st.session_state[S_RUBRICS_KIND] = "apigee" if layer_key == "reception" else "mule"
+
         arquetipo_path = obtener_arquetipo("reception" if layer_key == "reception" else "generic-mule")
+        if not arquetipo_path: return
 
-        if not arquetipo_path:
-            return  # `obtener_arquetipo` ya muestra un error
-
-        # 3. Renderizar el proyecto
         with st.spinner("🏗️ Construyendo proyecto desde la plantilla..."):
-            salida_zip = procesar_arquetipo(
-                arquetipo_dir=arquetipo_path,
-                context=contexto,
-                spec_bytes=st.session_state[S_EXTRACTED_BYTES],
-                spec_kind=st.session_state[S_EXTRACTED_KIND]
-            )
+            salida_zip = procesar_arquetipo(arquetipo_path, contexto, st.session_state[S_EXTRACTED_BYTES],
+                                            st.session_state[S_EXTRACTED_KIND])
 
         st.session_state[S_GENERATED_ZIP] = salida_zip
-        st.session_state[S_SERVICE_TYPE] = choice.upper()
 
-        st.success(f"✅ ¡Proyecto '{contexto.names.artifact_id}.zip' generado!")
+        # <<< NUEVO: Análisis con Rúbricas >>>
+        with st.spinner("🔍 Analizando calidad del proyecto generado..."):
+            temp_analysis_dir = Path(tempfile.mkdtemp())
+            with zipfile.ZipFile(salida_zip, 'r') as zip_ref:
+                zip_ref.extractall(temp_analysis_dir)
+
+            # Cargamos las definiciones de rúbricas
+            st.session_state[S_RUBRICS_DEFS] = cargar_rubricas(st.session_state[S_RUBRICS_KIND])
+
+            # Analizamos y guardamos las observaciones
+            observaciones = analizar_proyecto_con_rubricas(
+                project_path=temp_analysis_dir,
+                rubrics_kind=st.session_state[S_RUBRICS_KIND],
+                rubrics_defs=st.session_state[S_RUBRICS_DEFS]
+            )
+            st.session_state[S_OBSERVACIONES] = observaciones
+
+            shutil.rmtree(temp_analysis_dir)  # Limpiamos
+
+        resumen = f"✅ ¡Proyecto '{contexto.names.artifact_id}.zip' generado!"
+        if st.session_state[S_OBSERVACIONES]:
+            resumen += f"\n\n Se encontraron {len(st.session_state[S_OBSERVACIONES])} observaciones de calidad."
+        st.success(resumen)
 
     except Exception as e:
         st.error(f"💥 Ocurrió un error durante la generación: {e}")
+        st.exception(e)
     finally:
         st.session_state[S_IS_GENERATING] = False
         st.session_state[S_PENDING_ACTION] = None
@@ -188,9 +192,7 @@ if st.button("🔄 Reiniciar"):
     for k in list(st.session_state.keys()): del st.session_state[k]
     st.rerun()
 
-spec = st.file_uploader(
-    "Adjunta el ZIP de diseño (debe contener openapi.yaml o api.raml)", type=["zip"]
-)
+spec = st.file_uploader("Adjunta el ZIP de diseño", type=["zip"])
 
 if spec and st.session_state[S_UPLOADED_SPEC] is None:
     st.session_state[S_UPLOADED_SPEC] = spec
@@ -208,13 +210,24 @@ if st.session_state[S_UPLOADED_SPEC]:
     inferred = st.session_state[S_SERVICE_TYPE]
     default_idx = {"DOM": 0, "REC": 1, "BUS": 2, "PROXY": 3}.get(inferred, 4)
     st.session_state[S_ARCHETYPE_CHOICE] = st.radio(
-        "Selecciona la capa para generar el proyecto",
-        choices, index=default_idx, horizontal=True
+        "Selecciona la capa del proyecto", choices, index=default_idx, horizontal=True
     )
 
 # Historial de Chat y entrada de usuario
-# ... (la lógica del chat puede permanecer igual, llamando a `ejecutar_generacion`)
-if st.session_state.get(S_IS_GENERATING, False):
+for msg in st.session_state[S_MESSAGES]:
+    avatar = USER_AVATAR if msg["role"] == "user" else ASSISTANT_AVATAR
+    with st.chat_message(msg["role"], avatar=avatar):
+        st.markdown(msg["content"])
+
+# <<< NUEVO: Mostrar Observaciones >>>
+if st.session_state[S_OBSERVACIONES]:
+    st.markdown("---")
+    st.markdown("### ⚠️ Observaciones de Calidad (Rúbricas)")
+    for o in st.session_state[S_OBSERVACIONES]:
+        st.markdown(f"- {o}", unsafe_allow_html=True)
+    st.markdown("---")
+
+if st.session_state[S_IS_GENERATING]:
     st.info("⏳ Generando proyecto… El chat está deshabilitado.")
 
 if st.session_state.is_generating and st.session_state.pending_action == "generate":
@@ -233,8 +246,8 @@ if user_input and not st.session_state[S_IS_GENERATING]:
             {"role": "assistant", "content": "💬 Entendido. Para empezar, escribe \"crea el proyecto\"."})
         st.rerun()
 
-# Botón de descarga
 if st.session_state[S_GENERATED_ZIP]:
     zip_path = Path(st.session_state[S_GENERATED_ZIP])
-    with open(zip_path, "rb") as f:
-        st.download_button(f"⬇️ Descargar {zip_path.name}", f, file_name=zip_path.name)
+    if zip_path.exists():
+        with open(zip_path, "rb") as f:
+            st.download_button(f"⬇️ Descargar {zip_path.name}", f, file_name=zip_path.name)

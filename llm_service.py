@@ -1,114 +1,108 @@
 import os
 import re
-import tempfile
-import zipfile
-import shutil
-import xml.etree.ElementTree as ET
-from pathlib import Path
-from jinja2 import Environment, FileSystemLoader
+import yaml
+from openai import OpenAI
+from typing import Optional
 
-from constants import TEXT_EXTS
-from llm_service import UnifiedModel  # Usamos el modelo validado
+# Importamos el modelo desde nuestro nuevo archivo centralizado
+from models import UnifiedModel
 
+# --- OpenAI Client Setup ---
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+MODEL_BASE = "gpt-4o-mini"
 
-def render_template_directory(src_dir: Path, dest_dir: Path, context: UnifiedModel):
-    """
-    Renderiza un directorio completo de plantillas Jinja2.
-    """
-    env = Environment(loader=FileSystemLoader(searchpath=str(src_dir)), autoescape=False)
+PROMPT_UNIFICADO = """
+Responde con un ÚNICO YAML válido. Eres un generador de proyectos para cuatro capas:
+- Domain (Mule 4)
+- Business (Mule 4)
+- Proxy (Mule 4, reverse proxy)
+- Reception (Apigee)
 
-    # Convertimos el objeto Pydantic a un dict para pasarlo a Jinja
-    ctx_dict = context.dict()
+Objetivo:
+A partir de una ESPECIFICACIÓN (OpenAPI/RAML/texto) y la CAPA seleccionada ({capa}), emite un único YAML con toda la metadata necesaria para generar el proyecto final usando un motor de plantillas.
 
-    for path_plantilla in src_dir.rglob("*"):
-        ruta_relativa = path_plantilla.relative_to(src_dir)
-        path_destino = dest_dir / ruta_relativa
-        path_destino.parent.mkdir(parents=True, exist_ok=True)
+Entrada: Texto de la especificación.
+Salida: YAML unificado que se usará como contexto para renderizar las plantillas del arquetipo.
 
-        if path_plantilla.is_dir():
-            continue
+Estructura obligatoria del YAML:
 
-        # Copia archivos binarios directamente
-        if path_plantilla.suffix.lower() not in TEXT_EXTS and path_plantilla.name.lower() != "pom.xml":
-            shutil.copy(path_plantilla, path_destino)
-            continue
+layer: domain | business | proxy | reception
+names:
+  project_name: string
+  artifact_id: string-kebab
+  version: "1.0.0"
+  group_id: com.company.domain
+  api_display_name: string
+  api_name: string-kebab
+paths:
+  base_path: "/v1/resource"
+  base_uri: "https://host/v1"
+  target_base_url: "https://host/v1"
+upstream:
+  protocol: HTTP|HTTPS|null
+  host: string|null
+  path: "/v1" | "/" | null
+security:
+  auth: none | apikey | oauth2
+  cors: true|false
+  quota:
+    enabled: true|false
+    interval: 1
+    timeUnit: minute|hour|day
+    limit: 60
+  spike_arrest:
+    enabled: true|false
+    rate: "10ps"
+transformations:
+  - set_mule_pom: true
+notes: "supuestos y aclaraciones breves"
 
-        try:
-            template = env.get_template(str(ruta_relativa))
-            contenido_renderizado = template.render(ctx_dict)
-            path_destino.write_text(contenido_renderizado, encoding="utf-8")
-        except Exception as e:
-            # Si un archivo de texto falla (ej. no es una plantilla), lo copiamos tal cual
-            print(f"Info: No se pudo renderizar '{ruta_relativa}' como plantilla. Copiando original. Error: {e}")
-            shutil.copy(path_plantilla, path_destino)
-
-
-def post_process_mule_project(project_root: Path, context: UnifiedModel):
-    """
-    Aplica lógicas específicas de Mule que son difíciles de manejar solo con plantillas.
-    (Ej: generar flujos dinámicamente si fuera necesario, aunque la mayoría se puede hacer con plantillas).
-    Por ahora, nos enfocamos en el README y scripts.
-    """
-    readme_path = project_root / "README.md"
-    readme_content = f"""
-# {context.names.project_name}
-
-Proyecto generado automáticamente.
-
-- **Capa:** {context.layer.upper()}
-- **Artifact ID:** `{context.names.artifact_id}`
-- **Group ID:** `{context.names.group_id}`
-- **Versión:** `{context.names.version}`
-- **Path Base:** `{context.paths.base_path}`
+Reglas:
+- Deriva artifact_id y api_name en kebab-case si faltan.
+- No inventes hosts/URLs si no están en la especificación: deja null.
+- Responde únicamente con el bloque de código YAML, sin explicaciones.
 """
-    readme_path.write_text(readme_content, encoding="utf-8")
 
 
-def procesar_arquetipo(arquetipo_dir: str, context: UnifiedModel, spec_bytes: bytes, spec_kind: str) -> str:
+def _gpt(messages, temperature=0.1, model=MODEL_BASE) -> str:
+    """Función base para llamar a la API de OpenAI."""
+    try:
+        resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Error llamando a la API de OpenAI: {e}")
+        return ""
+
+
+def inferir_contexto_unificado(contenido_api: str, layer_choice: str) -> Optional[UnifiedModel]:
     """
-    Función unificada para procesar cualquier arquetipo.
+    Realiza la ÚNICA llamada al LLM para obtener el contexto y lo valida con Pydantic.
     """
-    src_path = Path(arquetipo_dir)
-    # Usamos un directorio temporal para el proyecto generado
-    dest_path = Path(tempfile.mkdtemp())
+    layer_key = {
+        "Domain": "domain", "Business": "business", "Proxy": "proxy", "Reception": "reception"
+    }.get(layer_choice, "domain")
 
-    print(f"Generando proyecto en: {dest_path}")
+    prompt = PROMPT_UNIFICADO.format(capa=layer_key)
+    messages = [
+        {"role": "system", "content": "Responde solo con un bloque de código YAML válido."},
+        {"role": "user", "content": f"{prompt}\n\n=== ESPECIFICACIÓN ===\n{contenido_api}"}
+    ]
 
-    # 1. Renderizar el arquetipo-plantilla con el contexto del LLM
-    render_template_directory(src_path, dest_path, context)
+    raw_yaml = _gpt(messages)
 
-    # 2. Pasos de post-procesamiento específicos de la capa
-    if context.layer in ["domain", "business", "proxy"]:
-        # Colocar la especificación (RAML/OAS) en el lugar correcto
-        api_dir = dest_path / "src/main/resources/api"
-        api_dir.mkdir(parents=True, exist_ok=True)
-        spec_filename = "api.raml" if spec_kind == "RAML" else "openapi.yaml"
-        (api_dir / spec_filename).write_bytes(spec_bytes)
+    match = re.search(r"```(?:yaml|yml)?\s*(.*?)```", raw_yaml, re.DOTALL)
+    clean_yaml = match.group(1).strip() if match else raw_yaml
 
-        post_process_mule_project(dest_path, context)
+    try:
+        data = yaml.safe_load(clean_yaml)
+        if not data:
+            print("Advertencia: El LLM devolvió un YAML vacío.")
+            return None
 
-    elif context.layer == "reception":
-        # Renombrar el bundle de Apigee si es necesario
-        try:
-            apiproxy_bundle_dir = next(dest_path.glob("**/apiproxy")).parent
-            if apiproxy_bundle_dir.name != context.names.api_name:
-                target_dir = apiproxy_bundle_dir.parent / context.names.api_name
-                shutil.move(str(apiproxy_bundle_dir), str(target_dir))
-        except (StopIteration, Exception) as e:
-            print(f"Advertencia: No se pudo renombrar el bundle de Apigee. {e}")
+        validated_data = UnifiedModel.model_validate(data)  # .model_validate para Pydantic v2
+        return validated_data
 
-        # Colocar la especificación OAS
-        oas_path = dest_path / context.names.api_name / "apiproxy/resources/oas/openapi.json"
-        oas_path.parent.mkdir(parents=True, exist_ok=True)
-        oas_path.write_bytes(spec_bytes)  # Asumimos que la especificación ya está en el formato correcto
-
-    # 3. Comprimir el resultado en un archivo ZIP
-    output_zip_path = Path(tempfile.gettempdir()) / f"{context.names.artifact_id}.zip"
-    with zipfile.ZipFile(output_zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in dest_path.rglob("*"):
-            z.write(p, p.relative_to(dest_path))
-
-    # Limpiar el directorio temporal
-    shutil.rmtree(dest_path)
-
-    return str(output_zip_path)
+    except (yaml.YAMLError, Exception) as e:
+        print(f"Error al parsear o validar el YAML del LLM: {e}")
+        print(f"--- YAML recibido ---\n{clean_yaml}\n--------------------")
+        return None
