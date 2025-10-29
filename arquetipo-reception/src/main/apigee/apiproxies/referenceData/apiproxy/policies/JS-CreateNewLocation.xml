@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Javascript async="false" continueOnError="false" enabled="true" timeLimit="800" name="JS-CreateNewLocation">
-    <DisplayName>JS-CreateNewLocation</DisplayName>
-    <Properties/>
-    <ResourceURL>jsc://JS-MappingLocation.js</ResourceURL>
-</Javascript>

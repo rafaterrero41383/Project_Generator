@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Javascript async="false" continueOnError="false" enabled="true" timeLimit="800" name="JS-EvaluateSchema">
-    <DisplayName>JS-EvaluateSchema</DisplayName>
-    <Properties/>
-    <IncludeURL>jsc://schema.js</IncludeURL>
-    <IncludeURL>jsc://tv4.js</IncludeURL>
-    <ResourceURL>jsc://JS-ValidSchema.js</ResourceURL>
-</Javascript>

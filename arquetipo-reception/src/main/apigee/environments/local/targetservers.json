@@ -1,9 +1,0 @@
-[
-  {
-    "enabled": true,
-    "name": "ts-reference-data",
-    "description": "target for local development",
-    "host": "bus-reference-data-api-impl-ltiaip.f9gzed.usa-e1.cloudhub.io",
-    "port": 443
-  }
-]

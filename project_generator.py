@@ -67,19 +67,20 @@ if "messages" not in st.session_state: st.session_state.messages = []
 if "uploaded_spec" not in st.session_state: st.session_state.uploaded_spec = None
 if "generated_zip" not in st.session_state: st.session_state.generated_zip = None
 if "observaciones" not in st.session_state: st.session_state.observaciones = []
-if "service_type" not in st.session_state: st.session_state.service_type = "UNKNOWN"
+if "service_type" not in st.session_state: st.session_state.service_type = "UNKNOWN"  # REC|DOM|BUS|PROXY|UNKNOWN
 if "spec_name" not in st.session_state: st.session_state.spec_name = None
-if "spec_kind" not in st.session_state: st.session_state.spec_kind = None   # "RAML" | "OAS" | "TEXT"
+if "spec_kind" not in st.session_state: st.session_state.spec_kind = None   # "RAML" | "OAS" | "TEXT" | "ZIP"
 if "is_generating" not in st.session_state: st.session_state.is_generating = False
 if "pending_action" not in st.session_state: st.session_state.pending_action = None
 if "archetype_choice" not in st.session_state: st.session_state.archetype_choice = "Automático"
 if "rubrics_defs" not in st.session_state: st.session_state.rubrics_defs = []
 if "rubrics_kind" not in st.session_state: st.session_state.rubrics_kind = "mule"  # mule|apigee
+if "ctx_text" not in st.session_state: st.session_state.ctx_text = ""
 
 TYPE_LABELS = {
     "REC": "RECEPTION",
     "DOM": "DOMAIN",
-    "BUS": "BUSINESS RULES",
+    "BUS": "BUSINESS",
     "PROXY": "PROXY",
     "UNKNOWN": "UNKNOWN"
 }
@@ -94,7 +95,7 @@ with col2:
 
 # ========= Utilidades =========
 
-TEXT_EXTS = {".xml",".json",".yaml",".yml",".raml",".properties",".txt",".pom",".md",".js"}
+TEXT_EXTS = {".xml",".json",".yaml",".yml",".raml",".properties",".txt",".pom",".md",".js",".gradle",".groovy"}
 INVALID_WIN = r'[:*?"<>|\\/]'
 
 def safe_filename(stx: str, fallback: str = "root") -> str:
@@ -106,21 +107,21 @@ def safe_filename(stx: str, fallback: str = "root") -> str:
     return s or fallback
 
 def _map_prefix_to_type(filename: str) -> str | None:
-    """Detecta tipo por prefijo o patrón en el nombre del archivo."""
+    """Detecta tipo por prefijo/patrón en el nombre del archivo ZIP de diseño."""
     if not filename:
         return None
     fname = filename.lower()
-    # prefijos tradicionales
     m = re.match(r"^(rec|dom|bus|pro)[-_]", fname)
     if m:
         pref = m.group(1)
         return {"rec":"REC","dom":"DOM","bus":"BUS","pro":"PROXY"}.get(pref)
-    # patrones en medio del nombre (ej: mx-api-bc-rec-..., mx-api-bc-dom-...)
     if "-rec-" in fname or fname.startswith("rec-") or fname.endswith("-rec.zip"):
         return "REC"
     if "-dom-" in fname or fname.startswith("dom-"):
         return "DOM"
-    if "proxy" in fname:
+    if "-bus-" in fname or fname.startswith("bus-"):
+        return "BUS"
+    if "proxy" in fname or "-pro-" in fname:
         return "PROXY"
     return None
 
@@ -134,7 +135,7 @@ def leer_especificacion(file) -> str:
     name = (file.name or "").lower()
     file.seek(0)
 
-    # === Nuevo: ZIP de diseños ===
+    # === ZIP de diseño ===
     if name.endswith(".zip"):
         st.session_state.spec_kind = "ZIP"
         data = file.read()
@@ -149,7 +150,6 @@ def leer_especificacion(file) -> str:
             ctx_text = _read_docx_bytes(inner_bytes) if inner_name.lower().endswith(".docx") \
                        else inner_bytes.decode("utf-8", "ignore")
         else:
-            # OAS/RAML/RAW → intentar decodificar; si falla, queda vacío
             try:
                 ctx_text = inner_bytes.decode("utf-8", "ignore")
             except Exception:
@@ -157,7 +157,7 @@ def leer_especificacion(file) -> str:
         st.session_state.ctx_text = ctx_text
         return ctx_text
 
-    # === Compatibilidad: archivos sueltos ===
+    # === Compatibilidad archivos sueltos ===
     if name.endswith(".raml"):
         st.session_state.spec_kind = "RAML"
         return file.read().decode("utf-8", errors="ignore")
@@ -228,7 +228,6 @@ def _best_candidate_from_zip(z: zipfile.ZipFile) -> tuple[str,str,bytes]:
         kind = "OAS" if ext in ("yaml","yml","json") else "RAW"
         return (kind, n, z.read(n))
 
-    # si no hay nada textual, devolvemos el ZIP entero como bytes “raw”
     return ("RAW", names[0] if names else "bundle.zip", z.read(names[0])) if names else ("RAW","bundle.zip",b"")
 
 # ✅ Validadores
@@ -257,38 +256,47 @@ def _file_sha256(path: str, chunk=1024*1024) -> str:
             h.update(b)
     return h.hexdigest()
 
-def obtener_arquetipo_generic() -> str | None:
+def _prefer_zip_or_dir(candidates: list[str]) -> str | None:
+    for c in candidates:
+        p = Path(c)
+        if p.exists(): return str(p.resolve())
+    # Búsqueda heurística en cwd
     for f in os.listdir():
-        p = Path(f)
-        if p.is_dir() and "arquetipo" in p.name.lower() and "reception" not in p.name.lower():
-            return str(p.resolve())
-    for f in os.listdir():
-        if f.endswith(".zip") and "arquetipo" in f.lower() and "reception" not in f.lower():
+        if any(key in f.lower() for key in ["mx-ms-bc-rec-", "apiproxy", "apigee", "reception"]):
             return str(Path(f).resolve())
-    demo = "/mnt/data/arquetipo-mulesoft.zip"
-    if os.path.exists(demo):
-        return demo
     return None
 
+def obtener_arquetipo_generic() -> str | None:
+    # Arquetipo genérico Mule (DOM/BUS)
+    candidates = []
+    for f in os.listdir():
+        p = Path(f)
+        if p.is_dir() and ("arquetipo" in p.name.lower()) and ("reception" not in p.name.lower()):
+            candidates.append(str(p.resolve()))
+        if p.is_file() and p.suffix.lower()==".zip" and ("arquetipo" in p.name.lower()) and ("reception" not in p.name.lower()):
+            candidates.append(str(p.resolve()))
+        if p.is_file() and p.suffix.lower()==".zip" and re.search(r"mx-ms-bc-dom-.*-mule", p.name.lower()):
+            candidates.append(str(p.resolve()))
+    demo = "/mnt/data/arquetipo-mulesoft.zip"
+    if os.path.exists(demo):
+        candidates.append(demo)
+    return _prefer_zip_or_dir(candidates)
+
 def obtener_arquetipo_reception() -> str | None:
+    # Arquetipo REC Apigee
+    candidates = []
     for f in os.listdir():
         p = Path(f)
-        if p.is_dir() and "arquetipo-reception" in p.name.lower():
-            return str(p.resolve())
-    for f in os.listdir():
-        if f.lower().endswith(".zip") and "arquetipo-reception" in f.lower():
-            return str(Path(f).resolve())
-    for f in os.listdir():
-        p = Path(f)
-        if p.is_dir() and re.search(r"rec[-_].*customeridentity", p.name.lower()):
-            return str(p.resolve())
-    for f in os.listdir():
-        if f.lower().endswith(".zip") and re.search(r"rec[-_].*customeridentity", f.lower()):
-            return str(Path(f).resolve())
+        if p.is_dir() and ("arquetipo-reception" in p.name.lower()):
+            candidates.append(str(p.resolve()))
+        if p.is_file() and p.suffix.lower()==".zip" and ("arquetipo-reception" in p.name.lower()):
+            candidates.append(str(p.resolve()))
+        if p.is_file() and p.suffix.lower()==".zip" and re.search(r"mx-ms-bc-rec-.*apigee", p.name.lower()):
+            candidates.append(str(p.resolve()))
     demo = "/mnt/data/arquetipo-reception.zip"
     if os.path.exists(demo):
-        return demo
-    return None
+        candidates.append(demo)
+    return _prefer_zip_or_dir(candidates)
 
 def preparar_arquetipo_trabajo(arquetipo_path: str) -> Path:
     p = Path(arquetipo_path)
@@ -412,130 +420,130 @@ var qp = (attributes.queryParams default {}) as Object
     xml = xml.replace("{ARTIFACT}", artifact_id)
     (dst_mule_dir / f"{artifact_id}-proxy.xml").write_text(xml, encoding="utf-8")
 
-# ========= LLM metadatos =========
+# ========= PROMPT UNIFICADO (contexto + reglas de transformación) =========
 
-PROMPT_CTX = """Eres un ingeniero de integración Mulesoft.
-Dado un RAML u OpenAPI (OAS) o contenido DTM en texto, entrega un YAML válido con estas claves:
+PROMPT_UNIFICADO = """Responde con un ÚNICO YAML válido. Eres un generador de proyectos para cuatro capas:
+- Domain (Mule 4)
+- Business (Mule 4)
+- Proxy (Mule 4, reverse proxy)
+- Reception (Apigee)
 
-project_name: nombre amigable del proyecto (string)
-artifact_id: id maven en kebab-case (string)
-version: semver (string, ej: 1.0.0)
-group_id: maven groupId (string, por defecto com.company.experience)
-tipo_api: Experience | System | Process (si no aplica, null)
-base_uri: URI base del API si se infiere (string o null)
-host_name: host si se puede inferir (string o null)
-protocol: HTTP/HTTPS si se infiere (string o null)
-base_path: path base sin host/protocolo; sin barra inicial (string o null)
-general_path: path del listener para ${general.path} (string, ej: "/api/*")
-upstream_host: host del sistema objetivo (string o null)
-upstream_protocol: HTTP/HTTPS (string o null)
-upstream_path: path base (string, ej: "/v1/endpoint")
-media_type: mediaType si existe (string o null)
-protocols: protocolos si existen (string o null)
+Objetivo:
+A partir de un ZIP de diseño que contenga la ESPECIFICACIÓN (OpenAPI/RAML o documento de texto) y la CAPA seleccionada ({capa}), emite un único YAML con
+contexto + reglas de transformación para generar el proyecto final (sustitución de nombres, rutas y policies). El sistema extrae automáticamente
+del ZIP el mejor candidato (openapi.*, *.raml o *.docx).
+
+Entrada: un ZIP de diseño (contiene OpenAPI/RAML/TXT). Extrae el mejor candidato y úsalo como especificación fuente.
+Salida: YAML unificado con CONTEXTO + TRANSFORMACIONES que el programa aplicará de forma determinista al arquetipo de la capa seleccionada.
+
+Estructura obligatoria del YAML:
+
+layer: domain | business | proxy | reception
+names:
+  project_name: string                # Mule (Domain/Business/Proxy)
+  artifact_id: string-kebab           # Mule/APIGEE (como aplique)
+  version: "1.0.0"
+  group_id: com.company.domain        # Mule
+  # Reception (Apigee):
+  api_display_name: string
+  api_name: string-kebab
+paths:
+  base_path: "/v1/resource"           # Mule listener (general.path) o Apigee <BasePath>
+  base_uri: "https://host/v1"         # Mule Proxy (si aplica) o null
+  target_base_url: "https://host/v1"  # Apigee TargetEndpoint
+upstream:
+  protocol: HTTP|HTTPS|null
+  host: string|null
+  path: "/v1" | "/" | null
+security:
+  auth: none | apikey | oauth2
+  cors: true|false
+  quota:
+    enabled: true|false
+    interval: 1
+    timeUnit: minute|hour|day
+    limit: 60
+  spike_arrest:
+    enabled: true|false
+    rate: "10ps"
+transformations:
+  # Declarativas, se aplican al arquetipo seleccionado
+  - set_mule_pom: true                          # Mule: groupId/artifactId/name/version
+  - set_mule_listener_path: "${general.path}"   # Mule sin APIkit
+  - set_mule_proxy_target: true                 # Mule Proxy: protocol/host/port/basePath desde base_uri
+  - set_apigee_basepath: true                   # Apigee proxies/default.xml
+  - set_apigee_target_url: true                 # Apigee targets/backend.xml
+  - set_apigee_policies:
+      cors: auto        # auto|on|off
+      quota: auto
+      spike_arrest: auto
+      verify_apikey: auto
+  - rename_api_identifiers:
+      from: [ "mx-api-bc-dom-xxx", "mx-ms-bc-rec-xxx" ]
+      to:   [ "${names.artifact_id}", "${names.api_name}" ]
+notes: "supuestos y aclaraciones breves"
 
 Reglas:
-- artifact_id = project_name en kebab-case.
-- general_path: si hay base_path o primer endpoint, usar "/<path>/*".
-- No incluyas texto fuera del YAML.
-"""
-
-PROMPT_APIGEE = """Eres un ingeniero de plataformas Apigee.
-Dado un OpenAPI (OAS) o descripción en texto, devuelve YAML válido con:
-
-api_display_name: nombre amigable (string)
-api_name: nombre del bundle/apiproxy en kebab-case (string)
-base_path: basePath del proxy, inicia con "/" (string, ej: "/reference-data")
-target_base_url: URL base del backend (string, ej: "https://backend.company.com/v1")
-products: lista de nombres de API Products sugeridos (lista de strings)
-quota:
-  enabled: true|false
-  interval: 1
-  timeUnit: minute|hour|day
-  limit: 60
-spike_arrest:
-  enabled: true|false
-  rate: "10ps"
-cors:
-  enabled: true|false
-auth:
-  type: "none|apikey|oauth2"
-notes: texto breve con supuestos
-
-Reglas:
-- api_name en kebab-case desde api_display_name.
-- No incluyas texto fuera del YAML.
+- Deriva artifact_id y api_name en kebab-case desde project_name/api_display_name si faltan.
+- No inventes hosts/URLs si no están en la especificación: deja null y no actives la transformación asociada.
+- Mantén simple: no agregues texto fuera del YAML.
 """
 
 def _gpt(messages, temperature=0.2, model=MODEL_BASE) -> str:
     resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
     return resp.choices[0].message.content.strip()
 
-def inferir_metadatos(contenido_api: str) -> dict:
+def inferir_yaml_unificado(contenido_api: str, layer_choice: str) -> dict:
+    """Pide al LLM el YAML unificado y lo normaliza para la capa elegida."""
+    layer_key = {
+        "Domain": "domain",
+        "Business": "business",
+        "Proxy": "proxy",
+        "Reception": "reception"
+    }.get(layer_choice, "domain")
+
     yml = _gpt([
         {"role":"system","content":"Responde solo YAML válido."},
-        {"role":"user","content": PROMPT_CTX + "\n\n=== ESPECIFICACIÓN ===\n" + contenido_api}
+        {"role":"user","content": f"{PROMPT_UNIFICADO}\n\nCapa seleccionada: {layer_key}\n\n=== ESPECIFICACIÓN ===\n{contenido_api}"}
     ], temperature=0.1)
 
     m = re.search(r"```(?:yaml|yml)?\s*(.*?)```", yml, re.DOTALL)
     if m: yml = m.group(1).strip()
+
     try:
         data = yaml.safe_load(yml) or {}
     except Exception:
         data = {}
 
-    data.setdefault("project_name", "MuleApplication")
-    if "artifact_id" not in data:
-        slug = re.sub(r"[^a-zA-Z0-9]+","-", data["project_name"]).strip("-").lower()
-        data["artifact_id"] = re.sub(r"-{2,}","-", slug)
-    data.setdefault("version","1.0.0")
-    data.setdefault("group_id","com.company.experience")
-    data.setdefault("general_path","/api/*")
-    data.setdefault("upstream_host", data.get("host_name"))
-    data.setdefault("upstream_protocol", data.get("protocol"))
-    if not data.get("upstream_path"):
-        base_path = (data.get("base_path") or "").lstrip("/")
-        data["upstream_path"] = ("/"+base_path) if base_path else "/"
+    # Normalización mínima
+    data.setdefault("layer", layer_key)
+    data.setdefault("names", {})
+    data.setdefault("paths", {})
+    data.setdefault("upstream", {})
+    data.setdefault("security", {})
+    data.setdefault("transformations", [])
 
-    return aplicar_perfil_por_capa(data)
-
-def inferir_metadatos_apigee(contenido_api: str) -> dict:
-    yml = _gpt([
-        {"role":"system","content":"Responde solo YAML válido."},
-        {"role":"user","content": PROMPT_APIGEE + "\n\n=== ESPECIFICACIÓN ===\n" + contenido_api}
-    ], temperature=0.1)
-    m = re.search(r"```(?:yaml|yml)?\s*(.*?)```", yml, re.DOTALL)
-    if m: yml = m.group(1).strip()
-    try:
-        data = yaml.safe_load(yml) or {}
-    except Exception:
-        data = {}
-    # Defaults
-    data.setdefault("api_display_name", "Reference Data")
-    if "api_name" not in data:
-        slug = re.sub(r"[^a-zA-Z0-9]+","-", data["api_display_name"]).strip("-").lower()
-        data["api_name"] = re.sub(r"-{2,}","-", slug or "reference-data")
-    data.setdefault("base_path", "/api")
-    data.setdefault("target_base_url", "https://backend.example.com")
-    data.setdefault("products", ["ref-data-basic"])
-    data.setdefault("quota", {"enabled": False})
-    data.setdefault("spike_arrest", {"enabled": False})
-    data.setdefault("cors", {"enabled": True})
-    data.setdefault("auth", {"type": "none"})
+    # Derivaciones
+    pn = data["names"].get("project_name") or data["names"].get("api_display_name") or "MuleApplication"
+    slug = re.sub(r"[^a-zA-Z0-9]+","-", pn).strip("-").lower() or "mule-application"
+    data["names"].setdefault("artifact_id", slug)
+    if data["layer"] == "reception":
+        ad = data["names"].get("api_display_name") or pn
+        apislug = re.sub(r"[^a-zA-Z0-9]+","-", ad).strip("-").lower() or "reference-data"
+        data["names"].setdefault("api_display_name", ad)
+        data["names"].setdefault("api_name", apislug)
+        data["paths"].setdefault("base_path", "/api")
+        data["paths"].setdefault("target_base_url", "https://backend.example.com")
+        data["security"].setdefault("auth", "none")
+        data["security"].setdefault("cors", True)
+        data["security"].setdefault("quota", {"enabled": False})
+        data["security"].setdefault("spike_arrest", {"enabled": False})
+    else:
+        data["names"].setdefault("version","1.0.0")
+        data["names"].setdefault("group_id","com.company.domain" if data["layer"]=="domain" else
+                                                ("com.company.business" if data["layer"]=="business" else "com.company.proxy"))
+        data["paths"].setdefault("base_path", "/api/*")
     return data
-
-# ========= Perfil por capa =========
-
-def aplicar_perfil_por_capa(ctx: dict) -> dict:
-    capa = (ctx.get("tipo_api") or "").strip().lower()
-    pref_map = {"experience": "exp", "system": "sys", "process": "prc"}
-    if capa in pref_map:
-        ctx.setdefault("layer_prefix", pref_map[capa])
-        if ctx.get("group_id","").startswith("com.company"):
-            ctx["group_id"] = f"com.company.{pref_map[capa]}"
-        if ctx.get("general_path") in (None, "", "/api/*"):
-            bp = (ctx.get("base_path") or "").strip("/")
-            ctx["general_path"] = ("/"+bp+"/*") if bp else f"/{pref_map[capa]}/*"
-    return ctx
 
 # ========= Postprocesos deterministas =========
 
@@ -850,19 +858,20 @@ def raml_classpath(root: Path) -> str|None:
 
 def transformar_archivo_con_gpt(fname: str, original: str, ctx: dict) -> str:
     PROMPT_FILE = """Eres un configurador experto de proyectos Mule 4 / Apigee.
-Actualiza el archivo indicado usando METADATOS (YAML).
+Actualiza el archivo indicado usando METADATOS (YAML unificado: contexto + transformaciones).
 
 Reglas:
 - Mantén formato/saltos.
 - No agregues explicaciones ni ``` .
-- Sustituye placeholders relevantes (groupId, artifactId, version, project.mule.name,
-  http listener path/port, http request host/protocol/path, exchange.json main/assetId/groupId/name/version,
-  properties YAML, nombre de apiproxy, basePath, TargetEndpoint URL, políticas (si aplican),
-  CORS/spike-arrest/quota/apikey/headers en Apigee).
-- Si un valor del contexto es null, no lo inventes.
+- Aplica solo transformaciones coherentes con el YAML (si una clave es null o falta, no inventes).
+- Sustituye placeholders relevantes:
+  * Mule: groupId, artifactId, version, project.mule.name, listener path/port, http-request host/protocol/path,
+          properties YAML, exchange.json, nombres de flows/archivos si procede.
+  * Apigee: nombre de apiproxy/bundle, BasePath, TargetEndpoint URL,
+            y políticas (VerifyAPIKey/SpikeArrest/Quota/CORS) según 'security' y 'transformations'.
 - No borres secciones no relacionadas.
 
-=== METADATOS (YAML) ===
+=== METADATOS (YAML UNIFICADO) ===
 {ctx_yaml}
 
 === ARCHIVO ({fname}) ORIGINAL ===
@@ -946,12 +955,12 @@ def enforce_pom_requirements(root_dir: Path, ctx: dict, use_apikit: bool):
 def write_readme(root: Path, raml_info: dict, ctx: dict, service_type: str, spec_kind: str | None):
     readme = root / "README.md"
     lines = [
-        "# Proyecto MuleSoft",
+        "# Proyecto generado",
         "",
-        f"**Service Type detectado:** `{TYPE_LABELS.get(service_type, service_type)}`",
+        f"**Capa detectada/seleccionada:** `{TYPE_LABELS.get(service_type, service_type)}`",
         f"**Especificación:** `{spec_kind or 'N/A'}`",
         "",
-        "## Árbol de carpetas",
+        "## Árbol de carpetas (Mule)",
         "",
         "```\nsrc/main/mule/\n  client/\n  handler/\n  orchestrator/\n  common/\n```",
         "",
@@ -991,9 +1000,9 @@ def write_readme(root: Path, raml_info: dict, ctx: dict, service_type: str, spec
     if service_type == "REC":
         lines += [
             "",
-            "## Nota REC / OAS",
-            "- Se copió el archivo OpenAPI a `src/main/apigee/.../resources/oas/rec-reference-data.json` (layout Reception) o a `src/main/resources/api/openapi.yaml` (layout genérico).",
-            "- La generación Apigee ajusta proxies, targets, políticas y JS según metadatos."
+            "## Layout Reception / Apigee",
+            "La OAS se copió a `src/main/apigee/apiproxies/<bundle>/apiproxy/resources/oas/rec-reference-data.json`.",
+            "Se ajustaron proxies, targets y políticas según metadatos."
         ]
     readme.write_text("\n".join(lines)+"\n", encoding="utf-8")
 
@@ -1221,7 +1230,6 @@ def rubric_observaciones_basic_apigee(root: Path):
     pols = list((apidir/"policies").glob("*.xml"))
     if not pols:
         notes.append("[Apigee] No hay políticas en policies/*.xml (se esperan VerifyAPIKey/SpikeArrest/Quota/AssignMessage/etc)")
-    # Naming sugerido
     bundle_name = apidir.parent.name
     if not re.match(r"^[A-Za-z0-9._-]+$", bundle_name):
         notes.append(f"[Naming] Nombre de bundle apiproxy '{bundle_name}' contiene caracteres no recomendados")
@@ -1390,7 +1398,10 @@ def procesar_arquetipo_mule(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|Non
                             except ET.ParseError: xml = f"<mule><flow name='{rname}_orchestrator_{m}'/></mule>"
                             o_path.write_text(xml, encoding="utf-8")
 
-    enforce_pom_requirements(root, ctx, use_apikit=False if service_type in ("PROXY","REC") else bool(raml_cp_value))
+    enforce_pom_requirements(root, {
+        "artifact_id": ctx.get("artifact_id"),
+        "project_name": ctx.get("project_name")
+    }, use_apikit=False if service_type in ("PROXY","REC") else bool(raml_cp_value))
     write_readme(root, raml_info, ctx, service_type, spec_kind)
     write_validate_script(root)
     if raml_info and service_type not in ("PROXY","REC"):
@@ -1409,10 +1420,10 @@ def procesar_arquetipo_mule(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|Non
 
 def procesar_arquetipo_apigee(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|None, spec_name: str, spec_kind: str):
     """
-    Reescribe el arquetipo Reception (Apigee) con metadatos de ChatGPT:
+    Reescribe el arquetipo Reception (Apigee) con metadatos unificados:
     - proxies/default.xml (BasePath)
     - targets/backend.xml (URL)
-    - policies/*.xml (Quota/Spike/CORS/VerifyAPIKey/AssignMessage etc., si aplican)
+    - policies/*.xml (Quota/Spike/CORS/VerifyAPIKey, si aplican)
     - resources/jsc/*.js (ajustes menores)
     - resources/oas (coloca OAS del usuario)
     """
@@ -1420,16 +1431,27 @@ def procesar_arquetipo_apigee(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|N
     tmp_dir = Path(tempfile.mkdtemp())
     shutil.copytree(src, tmp_dir, dirs_exist_ok=True)
     roots = [p for p in tmp_dir.rglob("apiproxy") if p.is_dir()]
-    root = tmp_dir  # raíz del proyecto generado
+    root = tmp_dir
 
     apiproxy_dir = roots[0] if roots else None
     if not apiproxy_dir:
-        # buscar estructura legacy
         maybe = list(tmp_dir.rglob("*/apiproxy"))
         if maybe:
             apiproxy_dir = maybe[0]
         else:
             raise RuntimeError("No se encontró carpeta 'apiproxy' en el arquetipo Reception")
+
+    # Nombre del bundle si hay placeholder de carpeta
+    bundle_parent = apiproxy_dir.parent
+    new_bundle = ctx.get("api_name") or "reference-data"
+    try:
+        if bundle_parent.name != new_bundle and bundle_parent.parent.exists():
+            target_dir = bundle_parent.parent / new_bundle
+            if not target_dir.exists():
+                shutil.move(str(bundle_parent), str(target_dir))
+                apiproxy_dir = target_dir / "apiproxy"
+    except Exception:
+        pass
 
     # Colocar OAS
     oas_dir = apiproxy_dir / "resources" / "oas"
@@ -1437,7 +1459,7 @@ def procesar_arquetipo_apigee(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|N
     oas_target = oas_dir / "rec-reference-data.json"
     if spec_bytes:
         try:
-            if spec_kind in ("OAS",) and (spec_name.lower().endswith((".yaml",".yml"))):
+            if spec_kind in ("OAS",) and (spec_name or "").lower().endswith((".yaml",".yml")):
                 data_oas = yaml.safe_load(spec_bytes.decode("utf-8","ignore"))
                 oas_target.write_text(json.dumps(data_oas, ensure_ascii=False, indent=2), encoding="utf-8")
             else:
@@ -1445,7 +1467,7 @@ def procesar_arquetipo_apigee(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|N
         except Exception:
             oas_target.write_bytes(spec_bytes)
 
-    # Transformar archivos clave con GPT
+    # Transformar archivos clave con GPT usando YAML unificado
     files_to_touch = []
     for p in apiproxy_dir.rglob("*"):
         if p.is_file() and (p.suffix.lower() in TEXT_EXTS or p.suffix.lower() in {".xml",".js"}):
@@ -1461,7 +1483,6 @@ def procesar_arquetipo_apigee(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|N
             if path.suffix.lower() == ".xml":
                 err = validar_xml(nuevo, path.name)
                 if err:
-                    # Si rompe, mantenemos original para no dañar bundle
                     nuevo = original
             elif path.suffix.lower() in (".yaml",".yml"):
                 err = validar_yaml(nuevo, path.name)
@@ -1488,125 +1509,154 @@ def procesar_arquetipo_apigee(arquetipo_dir: str, ctx: dict, spec_bytes: bytes|N
 def ejecutar_generacion():
     try:
         if not st.session_state.uploaded_spec:
-            st.session_state.messages.append({"role":"assistant","content":"⚠️ Primero adjunta un RAML, OAS (.yaml/.json) o DTM (.docx)."})
+            st.session_state.messages.append({"role":"assistant","content":"⚠️ Primero adjunta el ZIP de diseño (OpenAPI/RAML incluido dentro)."})
             st.session_state.is_generating = False
             st.session_state.pending_action = None
             return
 
-        # Elegir arquetipo
+        # Capa por radio
         choice = st.session_state.get("archetype_choice", "Automático")
         svc = st.session_state.get("service_type", "UNKNOWN")
 
-        # Si es Reception → Apigee
-        if choice == "Reception" or (choice == "Automático" and svc == "REC"):
-            # Cargar rúbricas de Apigee
+        # === Leer especificación del usuario y preparar contexto base ===
+        raw_ctx = st.session_state.get("ctx_text")
+        if not raw_ctx:
+            raw_ctx = leer_especificacion(st.session_state.uploaded_spec)
+
+        # === YAML unificado (contexto + reglas de transformación) ===
+        yaml_uni = inferir_yaml_unificado(raw_ctx or "", choice if choice != "Automático" else {
+            "REC":"Reception", "DOM":"Domain", "BUS":"Business", "PROXY":"Proxy"
+        }.get(svc, "Domain"))
+
+        # Adaptación ctx → Mule/Apigee internos para prompts de archivos
+        layer = (yaml_uni.get("layer") or "").lower()
+        if layer == "reception":
+            # Capa REC → Apigee
             st.session_state.rubrics_defs = _load_rubrics_from_root("Rubricas_Scaffold_Apigee.json", "Apigee")
             st.session_state.rubrics_kind = "apigee"
-
             arquetipo = obtener_arquetipo_reception()
             if not arquetipo:
-                st.session_state.messages.append({"role":"assistant","content":"❌ No encontré el ZIP/carpeta Reception (arquetipo-reception) en la raíz."})
+                st.session_state.messages.append({"role":"assistant","content":"❌ No encontré el arquetipo Reception (Apigee). Copia un *apigee bundle* de referencia en la raíz."})
                 st.session_state.is_generating = False
                 st.session_state.pending_action = None
                 return
-            use_reception_layout = True
+
+            ctx = {
+                # Campos que el transformador de archivos espera:
+                "layer": "reception",
+                "api_display_name": yaml_uni["names"].get("api_display_name"),
+                "api_name": yaml_uni["names"].get("api_name"),
+                "base_path": yaml_uni["paths"].get("base_path"),
+                "target_base_url": yaml_uni["paths"].get("target_base_url"),
+                "products": ["auto-generated"],
+                "quota": yaml_uni.get("security", {}).get("quota", {"enabled": False}),
+                "spike_arrest": yaml_uni.get("security", {}).get("spike_arrest", {"enabled": False}),
+                "cors": {"enabled": bool(yaml_uni.get("security", {}).get("cors", True))},
+                "auth": {"type": yaml_uni.get("security", {}).get("auth", "none")},
+                "transformations": yaml_uni.get("transformations", []),
+                "notes": yaml_uni.get("notes","")
+            }
+
+            st.session_state.messages.append({"role":"assistant",
+                                              "content": f"🧾 YAML unificado:\n```yaml\n{yaml.safe_dump(yaml_uni, sort_keys=False, allow_unicode=True)}\n```"})
+
+            # Bytes reales de especificación
+            spec_kind_effective = st.session_state.get("extracted_kind") or st.session_state.get("spec_kind")
+            spec_bytes = st.session_state.get("extracted_bytes")
+            if not spec_bytes:
+                st.session_state.uploaded_spec.seek(0)
+                spec_bytes = st.session_state.uploaded_spec.read()
+
+            work_src = preparar_arquetipo_trabajo(arquetipo)
+
+            start_ts = time.time()
+            st.session_state.messages.append({"role":"assistant","content":"⚙️ Generando bundle Apigee (Reception): proxies/targets/policies/resources..."})
+            salida_zip = procesar_arquetipo_apigee(str(work_src), ctx, spec_bytes, st.session_state.get("spec_name"), spec_kind_effective)
+            end_ts = time.time()
+
+            st.session_state.generated_zip = salida_zip
+            st.session_state.service_type = "REC"
+            label = "RECEPTION"
+
         else:
-            # Cargar rúbricas Mule (por si veníamos de Apigee)
+            # Capa Mule (Domain/Business/Proxy)
             st.session_state.rubrics_defs = _load_rubrics_from_root("Rubrics_Generation_Mule.json", "Mule")
             st.session_state.rubrics_kind = "mule"
 
             arquetipo = obtener_arquetipo_generic()
             if not arquetipo:
-                st.session_state.messages.append({"role":"assistant","content":"❌ No encontré el arquetipo genérico (ZIP/carpeta con 'arquetipo') en la raíz."})
+                st.session_state.messages.append({"role":"assistant","content":"❌ No encontré arquetipo Mule genérico en la raíz."})
                 st.session_state.is_generating = False
                 st.session_state.pending_action = None
                 return
-            use_reception_layout = False
 
-        # Leer espec y construir contexto LLM
-        st.session_state.messages.append({"role":"assistant","content":"🧠 Leyendo especificación y construyendo contexto con ChatGPT..."})
-        # === Leer especificación del usuario y preparar contexto ===
-        st.session_state.messages.append(
-            {"role": "assistant", "content": "🧠 Leyendo especificación y construyendo contexto con ChatGPT..."})
+            # Contexto Mule
+            general_path = yaml_uni["paths"].get("base_path") or "/api/*"
+            # Asegurar wildcard si parece path base
+            if general_path and not general_path.endswith("*"):
+                if general_path.endswith("/"):
+                    general_path = general_path + "*"
+                elif general_path.endswith("/*"):
+                    pass
+                else:
+                    # si es tipo "/v1/recurso", usar "/v1/*"
+                    segs = general_path.rstrip("/").split("/")
+                    general_path = ("/" + segs[1] + "/*") if len(segs) > 1 else "/api/*"
 
-        raw_ctx = st.session_state.get("ctx_text")
-        if not raw_ctx:
-            raw_ctx = leer_especificacion(st.session_state.uploaded_spec)
+            ctx = {
+                "layer": layer,
+                "project_name": yaml_uni["names"].get("project_name") or yaml_uni["names"].get("api_display_name","MuleApplication"),
+                "artifact_id": yaml_uni["names"].get("artifact_id"),
+                "version": yaml_uni["names"].get("version","1.0.0"),
+                "group_id": yaml_uni["names"].get("group_id","com.company.domain"),
+                "general_path": general_path,
+                "base_uri": yaml_uni["paths"].get("base_uri"),
+                "upstream_host": yaml_uni["upstream"].get("host"),
+                "upstream_protocol": yaml_uni["upstream"].get("protocol"),
+                "upstream_path": yaml_uni["upstream"].get("path") or "/",
+                "transformations": yaml_uni.get("transformations", []),
+                "notes": yaml_uni.get("notes","")
+            }
 
-        # Selección de rubricas (mostrar de inmediato también en UI principal)
-        choice = st.session_state.get("archetype_choice", "Automático")
-        svc = st.session_state.get("service_type", "UNKNOWN")
-        use_reception_layout = (choice == "Reception" or (choice == "Automático" and svc == "REC"))
+            # bytes de especificación
+            spec_kind_effective = st.session_state.get("extracted_kind") or st.session_state.get("spec_kind")
+            spec_bytes = st.session_state.get("extracted_bytes")
+            if not spec_bytes:
+                st.session_state.uploaded_spec.seek(0)
+                spec_bytes = st.session_state.uploaded_spec.read()
 
-        if use_reception_layout:
-            if st.session_state.get("rubrics_kind") != "apigee":
-                st.session_state.rubrics_defs = _load_rubrics_from_root("Rubricas_Scaffold_Apigee.json", "Apigee")
-                st.session_state.rubrics_kind = "apigee"
-        else:
-            if st.session_state.get("rubrics_kind") != "mule":
-                st.session_state.rubrics_defs = _load_rubrics_from_root("Rubrics_Generation_Mule.json", "Mule")
-                st.session_state.rubrics_kind = "mule"
+            work_src = preparar_arquetipo_trabajo(arquetipo)
 
-        # Inferencia de metadatos con el contexto ya armado
-        if use_reception_layout:
-            apigee_ctx = inferir_metadatos_apigee(raw_ctx or "")
-            base_name = Path(st.session_state.get("spec_name") or apigee_ctx.get("api_name", "reference-data")).stem
-            apigee_ctx["api_display_name"] = apigee_ctx.get("api_display_name") or base_name
-            apigee_ctx["api_name"] = re.sub(r"-{2,}", "-", re.sub(r"[^a-zA-Z0-9]+", "-", base_name).strip("-").lower())
-            ctx = apigee_ctx
-        else:
-            mule_ctx = inferir_metadatos(raw_ctx or "")
-            base_name = Path(st.session_state.get("spec_name") or "MuleApplication").stem
-            slug = re.sub(r"[^a-zA-Z0-9]+", "-", base_name).strip("-").lower()
-            slug = re.sub(r"-{2,}", "-", slug) or "mule-application"
-            mule_ctx["project_name"] = base_name
-            mule_ctx["artifact_id"] = slug
-            ctx = mule_ctx
-
-        st.session_state.messages.append({"role": "assistant",
-                                          "content": f"🧾 Metadatos:\n```yaml\n{yaml.safe_dump(ctx, sort_keys=False, allow_unicode=True)}\n```"})
-
-        # bytes reales de especificación a inyectar en el proyecto
-        spec_kind_effective = st.session_state.get("extracted_kind") or st.session_state.get("spec_kind")
-        spec_bytes = st.session_state.get("extracted_bytes")
-        if not spec_bytes:
-            st.session_state.uploaded_spec.seek(0)
-            spec_bytes = st.session_state.uploaded_spec.read()
-
-        work_src = preparar_arquetipo_trabajo(arquetipo)
-
-        start_ts = time.time()
-        if use_reception_layout:
-            st.session_state.messages.append({"role":"assistant","content":"⚙️ Generando bundle Apigee (Reception): proxies/targets/policies/resources..."})
-            salida_zip = procesar_arquetipo_apigee(str(work_src), ctx, spec_bytes, st.session_state.get("spec_name"), st.session_state.get("spec_kind"))
-            label = "RECEPTION"
-        else:
+            start_ts = time.time()
             st.session_state.messages.append({"role":"assistant","content":"⚙️ Reescribiendo arquetipo Mule: POM + XML + README + MUnit + observaciones..."})
-            salida_zip = procesar_arquetipo_mule(str(work_src), ctx, spec_bytes, st.session_state.get("spec_kind"))
-            tipo = st.session_state.get("service_type","UNKNOWN")
-            label = TYPE_LABELS.get(tipo, tipo)
+            salida_zip = procesar_arquetipo_mule(str(work_src), ctx, spec_bytes, spec_kind_effective)
+            end_ts = time.time()
 
-        end_ts = time.time()
-        st.session_state.generated_zip = salida_zip
+            st.session_state.generated_zip = salida_zip
+            st.session_state.service_type = "PROXY" if layer=="proxy" else ("BUS" if layer=="business" else "DOM")
+            label = TYPE_LABELS.get(st.session_state.service_type, "UNKNOWN")
 
-        resumen = f"✅ Proyecto generado. Tipo detectado: **{label}**."
+            st.session_state.messages.append({"role":"assistant",
+                                              "content": f"🧾 YAML unificado:\n```yaml\n{yaml.safe_dump(yaml_uni, sort_keys=False, allow_unicode=True)}\n```"})
+
+        resumen = f"✅ Proyecto generado. Tipo: **{label}**."
         if st.session_state.observaciones:
-            resumen += f"\n⚠️ Observaciones: {len(st.session_state.observaciones)} (con rúbricas: {st.session_state.rubrics_kind})"
+            resumen += f"\n⚠️ Observaciones: {len(st.session_state.observaciones)} (rúbricas: {st.session_state.rubrics_kind})"
         st.session_state.messages.append({"role":"assistant","content":resumen})
-        st.info(f"🔎 Tipo de API: **{label}**")
+        st.info(f"🔎 Capa seleccionada: **{label}**")
 
         # 📤 Enviar log a Datadog
         dd_event = {
-            "event": "mule_project_generation" if not use_reception_layout else "apigee_project_generation",
+            "event": "apigee_project_generation" if label=="RECEPTION" else "mule_project_generation",
             "service_type": label,
             "archetype_choice": st.session_state.get("archetype_choice"),
             "spec_name": st.session_state.get("spec_name"),
             "spec_kind": st.session_state.get("spec_kind"),
-            "output_zip": Path(salida_zip).name,
+            "output_zip": Path(st.session_state.generated_zip).name,
             "observations_count": len(st.session_state.get("observaciones", [])),
             "rubrics_count": len(st.session_state.get("rubrics_defs", [])),
             "rubrics_kind": st.session_state.get("rubrics_kind"),
-            "metadatos": ctx,
+            "yaml_unificado": yaml_uni,
             "chat_history": st.session_state.get("messages", []),
             "started_at": datetime.datetime.utcfromtimestamp(start_ts).isoformat()+"Z",
             "finished_at": datetime.datetime.utcfromtimestamp(end_ts).isoformat()+"Z",
@@ -1635,7 +1685,7 @@ def manejar_mensaje(user_input: str):
 
     if ui in ("crear proyecto","crea el proyecto","genera el proyecto","crea el proyecto"):
         if not st.session_state.uploaded_spec:
-            st.session_state.messages.append({"role":"assistant","content":"⚠️ Primero adjunta un RAML, OAS (.yaml/.json) o DTM (.docx)."})
+            st.session_state.messages.append({"role":"assistant","content":"⚠️ Primero adjunta el ZIP de diseño con OAS/RAML dentro."})
             return
         st.session_state.is_generating = True
         st.session_state.pending_action = "generate"
@@ -1643,12 +1693,12 @@ def manejar_mensaje(user_input: str):
         st.rerun()
         return
     else:
-        st.session_state.messages.append({"role":"assistant","content":"💬 Escribe \"crea el proyecto\" para generar el zip a partir de tu especificación."})
+        st.session_state.messages.append({"role":"assistant","content":"💬 Escribe \"crea el proyecto\" para generar el ZIP del proyecto a partir de tu diseño."})
 
 # ========= Upload =========
 
 spec = st.file_uploader(
-    "Adjunta el ZIP de diseño (api-dom o api-rec)",
+    "Adjunta el ZIP de diseño (mx-api-bc-dom-* o mx-api-bc-rec-*). Debe contener openapi.* o .raml",
     type=["zip"]
 )
 if spec and st.session_state.uploaded_spec is None:
@@ -1660,17 +1710,19 @@ if spec and st.session_state.uploaded_spec is None:
     leer_especificacion(spec)
     st.session_state.messages.append({
         "role": "assistant",
-        "content": f"📦 Especificación \"{spec.name}\" cargada. Escribe \"crea el proyecto\"."
+        "content": f"📦 Especificación \"{spec.name}\" cargada. Elige la capa y escribe \"crea el proyecto\"."
     })
 
-# === Selector de arquetipo (auto / reception / genérico) ===
+# === Selector de capa/arquetipo (Domain / Reception / Business / Proxy) ===
 if st.session_state.get("uploaded_spec"):
-    choices = ["Domain", "Reception", "Business"]
-    default_idx = 0
-    if st.session_state.get("service_type") == "REC":
-        default_idx = 0
+    choices = ["Domain", "Reception", "Business", "Proxy", "Automático"]
+    default_idx = 4
+    # Si el ZIP sugiere tipo, marcamos:
+    inferred = st.session_state.get("service_type")
+    if inferred in ("REC","DOM","BUS","PROXY"):
+        default_idx = {"DOM":0, "REC":1, "BUS":2, "PROXY":3}[inferred]
     st.session_state.archetype_choice = st.radio(
-        "Arquetipo a usar",
+        "Selecciona la capa para generar el proyecto",
         choices,
         index=default_idx,
         horizontal=True,
@@ -1725,9 +1777,8 @@ else:
 # ====== Descarga ======
 if st.session_state.generated_zip:
     tipo = st.session_state.get("service_type","UNKNOWN")
-    label = "RECEPTION" if (st.session_state.get("archetype_choice")=="Reception" or tipo=="REC") else TYPE_LABELS.get(tipo, tipo)
-    st.info(f"🔎 La API es de tipo **{label}**")
-
+    label = TYPE_LABELS.get(tipo, tipo)
+    st.info(f"🔎 Capa: **{label}**")
     with open(st.session_state.generated_zip, "rb") as f:
         st.download_button("⬇️ Descargar Proyecto (.zip)", f,
                            Path(st.session_state.generated_zip).name,
